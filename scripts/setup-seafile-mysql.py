@@ -373,12 +373,12 @@ class AbstractDBConfigurator(AbstractConfigurator):
         AbstractConfigurator.__init__(self)
         self.mysql_host = 'localhost'
         self.mysql_port = 3306
-        self.mysql_userhost = 'localhost'
 
         self.use_existing_db = False
 
         self.seafile_mysql_user = ''
         self.seafile_mysql_password = ''
+        self.seafile_mysql_userhost = 'localhost'
 
         self.ccnet_db_name = ''
         self.seafile_db_name = ''
@@ -427,20 +427,19 @@ Please choose a way to initialize seafile databases:
                                              default=default,
                                              validate=self.validate_mysql_host)
 
-    def validate_mysql_user_host(self, mysql_userhost):
-        if mysql_userhost != '%':
-            if not re.match(r'^[^.].+\..+[^.]$', mysql_userhost):
-                raise InvalidAnswer('%s is not a valid ip or domain' % mysql_userhost)
-        return mysql_userhost
+    def validate_mysql_user_host(self, host):
+        MYSQL_HOST_RE = re.compile(r'^(%|[^.].+\..+[^.])$')
+        if not MYSQL_HOST_RE.match(host):
+            raise InvalidAnswer('invalid mysql user host: {}'.format(host))
+        return host
 
     def ask_mysql_user_host(self):
-        question = 'Which hosts should be able to use your MySQL Account?'
-        key = 'mysql user host'
-        default = '%'
-        self.mysql_userhost = Utils.ask_question(question,
-                                                 key=key,
-                                                 default=default,
-                                                 validate=self.validate_mysql_user_host)
+        self.seafile_mysql_userhost = Utils.ask_question(
+            'From which hosts could the mysql account be used?',
+            key='mysql user host',
+            default='%',
+            validate=self.validate_mysql_user_host
+        )
 
     def ask_mysql_port(self):
         question = 'What is the port of mysql server?'
@@ -571,7 +570,7 @@ class NewDBConfigurator(AbstractDBConfigurator):
         cursor = self.root_conn.cursor()
 
         sql = '''SELECT EXISTS(SELECT 1 FROM mysql.user WHERE user = '%s' and host = '%s')''' % \
-                (user, self.mysql_userhost)
+                (user, self.seafile_mysql_userhost)
 
         try:
             cursor.execute(sql)
@@ -579,10 +578,10 @@ class NewDBConfigurator(AbstractDBConfigurator):
         except Exception, e:
             if isinstance(e, MySQLdb.OperationalError):
                 Utils.error('Failed to check mysql user %s@%s: %s' % \
-                            (user, self.mysql_userhost, e.args[1]))
+                            (user, self.seafile_mysql_userhost, e.args[1]))
             else:
                 Utils.error('Failed to check mysql user %s@%s: %s' % \
-                            (user, self.mysql_userhost, e))
+                            (user, self.seafile_mysql_userhost, e))
         finally:
             cursor.close()
 
@@ -629,16 +628,19 @@ class NewDBConfigurator(AbstractDBConfigurator):
 
     def create_user(self):
         cursor = self.root_conn.cursor()
-        sql = '''CREATE USER '%s'@'%s' IDENTIFIED BY '%s' ''' \
-              % (self.seafile_mysql_user, self.mysql_userhost, self.seafile_mysql_password)
+        sql = '''CREATE USER '{}'@'{}' IDENTIFIED BY '{}' '''.format(
+            self.seafile_mysql_user,
+            self.seafile_mysql_userhost,
+            self.seafile_mysql_password
+        )
 
         try:
             cursor.execute(sql)
         except Exception, e:
             if isinstance(e, MySQLdb.OperationalError):
-                Utils.error('Failed to create mysql user %s@%s: %s' % (self.seafile_mysql_user, self.mysql_userhost, e.args[1]))
+                Utils.error('Failed to create mysql user {}@{}: {}'.format(self.seafile_mysql_user, self.seafile_mysql_userhost, e.args[1]))
             else:
-                Utils.error('Failed to create mysql user %s@%s: %s' % (self.seafile_mysql_user, self.mysql_userhost, e))
+                Utils.error('Failed to create mysql user {}@{}: {}'.format(self.seafile_mysql_user, self.seafile_mysql_userhost, e))
         finally:
             cursor.close()
 
@@ -660,8 +662,11 @@ class NewDBConfigurator(AbstractDBConfigurator):
 
     def grant_db_permission(self, db_name):
         cursor = self.root_conn.cursor()
-        sql = '''GRANT ALL PRIVILEGES ON `%s`.* to `%s`@`%s` ''' \
-              % (db_name, self.seafile_mysql_user, self.mysql_userhost)
+        sql = '''GRANT ALL PRIVILEGES ON `{}`.* to `{}`@`{}` '''.format(
+            db_name,
+            self.seafile_mysql_user,
+            self.seafile_mysql_userhost
+        )
 
         try:
             cursor.execute(sql)
@@ -1313,9 +1318,9 @@ def check_params(args):
         if db_config.mysql_host != '127.0.0.1' and not mysql_user_host:
             raise InvalidParams('mysql user host parameter is missing in creating new db mode')
         if not mysql_user_host:
-            db_config.mysql_userhost = 'localhost'
+            db_config.seafile_mysql_userhost = 'localhost'
         else:
-            db_config.mysql_userhost = db_config.validate_mysql_user_host(mysql_user_host)
+            db_config.seafile_mysql_userhost = db_config.validate_mysql_user_host(mysql_user_host)
 
         if not mysql_root_passwd:
             raise InvalidParams('mysql root password parameter is missing in creating new db mode')
