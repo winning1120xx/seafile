@@ -14,8 +14,8 @@
 
 #ifdef WIN32
 
-#include <windows.h>
 #include <winsock2.h>
+#include <windows.h>
 #include <ws2tcpip.h>
 #include <Rpc.h>
 #include <shlobj.h>
@@ -38,13 +38,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
-
 #include <string.h>
-#include <openssl/sha.h>
-#include <openssl/hmac.h>
-#include <openssl/evp.h>
-#include <openssl/bio.h>
-#include <openssl/buffer.h>
 
 #include <glib.h>
 #include <glib/gstdio.h>
@@ -56,18 +50,9 @@
 
 #include <zlib.h>
 
-extern int inet_pton(int af, const char *src, void *dst);
+#include "log.h"
 
 
-struct timeval
-timeval_from_msec (uint64_t milliseconds)
-{
-    struct timeval ret;
-    const uint64_t microseconds = milliseconds * 1000;
-    ret.tv_sec  = microseconds / 1000000;
-    ret.tv_usec = microseconds % 1000000;
-    return ret;
-}
 
 void
 rawdata_to_hex (const unsigned char *rawdata, char *hex_str, int n_bytes)
@@ -681,6 +666,8 @@ traverse_directory_win32 (wchar_t *path_w,
     int ret = 0;
 
     path = g_utf16_to_utf8 (path_w, -1, NULL, NULL, NULL);
+    if (!path)
+        return -1;
 
     path_len_w = wcslen(path_w);
 
@@ -731,6 +718,72 @@ out:
 }
 
 #endif
+
+#ifdef WIN32
+static inline gboolean
+has_trailing_space_or_period (const char *path)
+{
+    int len = strlen(path);
+    if (path[len - 1] == ' ' || path[len - 1] == '.') {
+        return TRUE;
+    }
+
+    return FALSE;
+}
+#endif
+
+gboolean
+should_ignore_on_checkout (const char *file_path, IgnoreReason *ignore_reason)
+{
+    gboolean ret = FALSE;
+
+#ifdef WIN32
+    static char illegals[] = {'\\', ':', '*', '?', '"', '<', '>', '|', '\b', '\t'};
+    char **components = g_strsplit (file_path, "/", -1);
+    int n_comps = g_strv_length (components);
+    int j = 0;
+    char *file_name;
+    int i;
+    char c;
+
+    for (; j < n_comps; ++j) {
+        file_name = components[j];
+
+        if (has_trailing_space_or_period (file_name)) {
+            /* Ignore files/dir whose path has trailing spaces. It would cause
+             * problem on windows. */
+            /* g_debug ("ignore '%s' which contains trailing space in path\n", path); */
+            ret = TRUE;
+            if (ignore_reason)
+                *ignore_reason = IGNORE_REASON_END_SPACE_PERIOD;
+            goto out;
+        }
+
+        for (i = 0; i < G_N_ELEMENTS(illegals); i++) {
+            if (strchr (file_name, illegals[i])) {
+                ret = TRUE;
+                if (ignore_reason)
+                    *ignore_reason = IGNORE_REASON_INVALID_CHARACTER;
+                goto out;
+            }
+        }
+
+        for (c = 1; c <= 31; c++) {
+            if (strchr (file_name, c)) {
+                ret = TRUE;
+                if (ignore_reason)
+                    *ignore_reason = IGNORE_REASON_INVALID_CHARACTER;
+                goto out;
+            }
+        }
+    }
+
+out:
+    g_strfreev (components);
+#endif
+
+    return ret;
+}
 
 ssize_t						/* Read "n" bytes from a descriptor. */
 readn(int fd, void *vptr, size_t n)
@@ -836,6 +889,155 @@ sendn(evutil_socket_t fd, const void *vptr, size_t n)
 	}
 	return(n);
 }
+
+#ifdef WIN32
+static SOCKET pg_serv_sock = INVALID_SOCKET;
+static struct sockaddr_in pg_serv_addr;
+
+/* seaf_pipe() should only be called in the main loop,
+ * since it accesses the static global socket.
+ */
+int
+seaf_pipe (seaf_pipe_t handles[2])
+{
+    int len = sizeof( pg_serv_addr );
+
+    handles[0] = handles[1] = INVALID_SOCKET;
+
+    if (pg_serv_sock == INVALID_SOCKET) {
+        if ((pg_serv_sock = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) {
+            seaf_warning("seaf_pipe failed to create socket: %d\n", WSAGetLastError());
+            return -1;
+        }
+
+        memset(&pg_serv_addr, 0, sizeof(pg_serv_addr));
+        pg_serv_addr.sin_family = AF_INET;
+        pg_serv_addr.sin_port = htons(0);
+        pg_serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+        if (bind(pg_serv_sock, (SOCKADDR *)&pg_serv_addr, len) == SOCKET_ERROR) {
+            seaf_warning("seaf_pipe failed to bind: %d\n", WSAGetLastError());
+            closesocket(pg_serv_sock);
+            pg_serv_sock = INVALID_SOCKET;
+            return -1;
+        }
+
+        if (listen(pg_serv_sock, SOMAXCONN) == SOCKET_ERROR) {
+            seaf_warning("seaf_pipe failed to listen: %d\n", WSAGetLastError());
+            closesocket(pg_serv_sock);
+            pg_serv_sock = INVALID_SOCKET;
+            return -1;
+        }
+
+        struct sockaddr_in tmp_addr;
+        int tmp_len = sizeof(tmp_addr);
+        if (getsockname(pg_serv_sock, (SOCKADDR *)&tmp_addr, &tmp_len) == SOCKET_ERROR) {
+            seaf_warning("seaf_pipe failed to getsockname: %d\n", WSAGetLastError());
+            closesocket(pg_serv_sock);
+            pg_serv_sock = INVALID_SOCKET;
+            return -1;
+        }
+        pg_serv_addr.sin_port = tmp_addr.sin_port;
+    }
+
+    if ((handles[1] = socket(PF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET)
+    {
+        seaf_warning("seaf_pipe failed to create socket 2: %d\n", WSAGetLastError());
+        closesocket(pg_serv_sock);
+        pg_serv_sock = INVALID_SOCKET;
+        return -1;
+    }
+
+    if (connect(handles[1], (SOCKADDR *)&pg_serv_addr, len) == SOCKET_ERROR)
+    {
+        seaf_warning("seaf_pipe failed to connect socket: %d\n", WSAGetLastError());
+        closesocket(handles[1]);
+        handles[1] = INVALID_SOCKET;
+        closesocket(pg_serv_sock);
+        pg_serv_sock = INVALID_SOCKET;
+        return -1;
+    }
+
+    struct sockaddr_in client_addr;
+    int client_len = sizeof(client_addr);
+    if ((handles[0] = accept(pg_serv_sock, (SOCKADDR *)&client_addr, &client_len)) == INVALID_SOCKET)
+    {
+        seaf_warning("seaf_pipe failed to accept socket: %d\n", WSAGetLastError());
+        closesocket(handles[1]);
+        handles[1] = INVALID_SOCKET;
+        closesocket(pg_serv_sock);
+        pg_serv_sock = INVALID_SOCKET;
+        return -1;
+    }
+
+    return 0;
+}
+
+int
+seaf_pipe_read (seaf_pipe_t fd, char *buf, int len)
+{
+    return recv (fd, buf, len, 0);
+}
+
+int
+seaf_pipe_write (seaf_pipe_t fd, const char *buf, int len)
+{
+    return send (fd, buf, len, 0);
+}
+
+int
+seaf_pipe_close (seaf_pipe_t fd)
+{
+    return closesocket (fd);
+}
+
+ssize_t seaf_pipe_readn (seaf_pipe_t fd, void *vptr, size_t n)
+{
+    return recvn (fd, vptr, n);
+}
+
+ssize_t seaf_pipe_writen (seaf_pipe_t fd, const void *vptr, size_t n)
+{
+    return sendn (fd, vptr, n);
+}
+
+#else
+
+int
+seaf_pipe (seaf_pipe_t handles[2])
+{
+    return pipe (handles);
+}
+
+int
+seaf_pipe_read (seaf_pipe_t fd, char *buf, int len)
+{
+    return read (fd, buf, len);
+}
+
+int
+seaf_pipe_write (seaf_pipe_t fd, const char *buf, int len)
+{
+    return write (fd, buf, len);
+}
+
+int
+seaf_pipe_close (seaf_pipe_t fd)
+{
+    return close (fd);
+}
+
+ssize_t seaf_pipe_readn (seaf_pipe_t fd, void *vptr, size_t n)
+{
+    return readn (fd, vptr, n);
+}
+
+ssize_t seaf_pipe_writen (seaf_pipe_t fd, const void *vptr, size_t n)
+{
+    return writen (fd, vptr, n);
+}
+
+#endif
 
 int copy_fd (int ifd, int ofd)
 {
@@ -994,14 +1196,16 @@ ccnet_expand_path (const char *src)
 int
 calculate_sha1 (unsigned char *sha1, const char *msg, int len)
 {
-    SHA_CTX c;
+    GChecksum *c;
+    gsize cs_len = 20;
 
     if (len < 0)
         len = strlen(msg);
 
-    SHA1_Init(&c);
-    SHA1_Update(&c, msg, len);    
-	SHA1_Final(sha1, &c);
+    c = g_checksum_new (G_CHECKSUM_SHA1);
+    g_checksum_update(c, (const unsigned char *)msg, len);    
+    g_checksum_get_digest (c, sha1, &cs_len);
+    g_checksum_free (c);
     return 0;
 }
 
@@ -1517,331 +1721,6 @@ get_current_time()
     g_get_current_time (&tv);
     t = tv.tv_sec * (gint64)1000000 + tv.tv_usec;
     return t;
-}
-
-#ifdef WIN32
-static SOCKET pg_serv_sock = INVALID_SOCKET;
-static struct sockaddr_in pg_serv_addr;
-
-/* pgpipe() should only be called in the main loop,
- * since it accesses the static global socket.
- */
-int
-pgpipe (ccnet_pipe_t handles[2])
-{
-    int len = sizeof( pg_serv_addr );
-
-    handles[0] = handles[1] = INVALID_SOCKET;
-
-    if (pg_serv_sock == INVALID_SOCKET) {
-        if ((pg_serv_sock = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) {
-            g_warning("pgpipe failed to create socket: %d\n", WSAGetLastError());
-            return -1;
-        }
-
-        memset(&pg_serv_addr, 0, sizeof(pg_serv_addr));
-        pg_serv_addr.sin_family = AF_INET;
-        pg_serv_addr.sin_port = htons(0);
-        pg_serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-        if (bind(pg_serv_sock, (SOCKADDR *)&pg_serv_addr, len) == SOCKET_ERROR) {
-            g_warning("pgpipe failed to bind: %d\n", WSAGetLastError());
-            closesocket(pg_serv_sock);
-            pg_serv_sock = INVALID_SOCKET;
-            return -1;
-        }
-
-        if (listen(pg_serv_sock, SOMAXCONN) == SOCKET_ERROR) {
-            g_warning("pgpipe failed to listen: %d\n", WSAGetLastError());
-            closesocket(pg_serv_sock);
-            pg_serv_sock = INVALID_SOCKET;
-            return -1;
-        }
-
-        struct sockaddr_in tmp_addr;
-        int tmp_len = sizeof(tmp_addr);
-        if (getsockname(pg_serv_sock, (SOCKADDR *)&tmp_addr, &tmp_len) == SOCKET_ERROR) {
-            g_warning("pgpipe failed to getsockname: %d\n", WSAGetLastError());
-            closesocket(pg_serv_sock);
-            pg_serv_sock = INVALID_SOCKET;
-            return -1;
-        }
-        pg_serv_addr.sin_port = tmp_addr.sin_port;
-    }
-
-    if ((handles[1] = socket(PF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET)
-    {
-        g_warning("pgpipe failed to create socket 2: %d\n", WSAGetLastError());
-        closesocket(pg_serv_sock);
-        pg_serv_sock = INVALID_SOCKET;
-        return -1;
-    }
-
-    if (connect(handles[1], (SOCKADDR *)&pg_serv_addr, len) == SOCKET_ERROR)
-    {
-        g_warning("pgpipe failed to connect socket: %d\n", WSAGetLastError());
-        closesocket(handles[1]);
-        handles[1] = INVALID_SOCKET;
-        closesocket(pg_serv_sock);
-        pg_serv_sock = INVALID_SOCKET;
-        return -1;
-    }
-
-    struct sockaddr_in client_addr;
-    int client_len = sizeof(client_addr);
-    if ((handles[0] = accept(pg_serv_sock, (SOCKADDR *)&client_addr, &client_len)) == INVALID_SOCKET)
-    {
-        g_warning("pgpipe failed to accept socket: %d\n", WSAGetLastError());
-        closesocket(handles[1]);
-        handles[1] = INVALID_SOCKET;
-        closesocket(pg_serv_sock);
-        pg_serv_sock = INVALID_SOCKET;
-        return -1;
-    }
-
-    return 0;
-}
-#endif
-
-/*
-  The EVP_EncryptXXX and EVP_DecryptXXX series of functions have a
-  weird choice of returned value.
-*/
-#define ENC_SUCCESS 1
-#define ENC_FAILURE 0
-#define DEC_SUCCESS 1
-#define DEC_FAILURE 0
-
-
-#include <openssl/aes.h>
-#include <openssl/evp.h>
-
-/* Block size, in bytes. For AES it can only be 16 bytes. */
-#define BLK_SIZE 16
-#define ENCRYPT_BLK_SIZE BLK_SIZE
-
-
-int
-ccnet_encrypt (char **data_out,
-               int *out_len,
-               const char *data_in,
-               const int in_len,
-               const char *code,
-               const int code_len)
-{
-    *data_out = NULL;
-    *out_len = -1;
-
-    /* check validation */
-    if ( data_in == NULL || in_len <= 0 ||
-         code == NULL || code_len <= 0) {
-
-        g_warning ("Invalid params.\n");
-        return -1;
-    }
-
-    EVP_CIPHER_CTX ctx;
-    int ret, key_len;
-    unsigned char key[16], iv[16];
-    int blks;                   
-
-    
-    /* Generate the derived key. We use AES 128 bits key,
-       Electroic-Code-Book cipher mode, and SHA1 as the message digest
-       when generating the key. IV is not used in ecb mode,
-       actually. */
-    key_len  = EVP_BytesToKey (EVP_aes_128_ecb(), /* cipher mode */
-                               EVP_sha1(),        /* message digest */
-                               NULL,              /* salt */
-                               (unsigned char*)code, /* passwd */
-                               code_len,
-                               3,   /* iteration times */
-                               key, /* the derived key */
-                               iv); /* IV, initial vector */
-
-    /* The key should be 16 bytes long for our 128 bit key. */
-    if (key_len != 16) {
-        g_warning ("failed to init EVP_CIPHER_CTX.\n");
-        return -1;
-    }
-
-    /* Prepare CTX for encryption. */
-    EVP_CIPHER_CTX_init (&ctx);
-
-    ret = EVP_EncryptInit_ex (&ctx,
-                              EVP_aes_128_ecb(), /* cipher mode */
-                              NULL, /* engine, NULL for default */
-                              key,  /* derived key */
-                              iv);  /* initial vector */
-
-    if (ret == ENC_FAILURE)
-        return -1;
-
-    /* Allocating output buffer. */
-    
-    /*
-      For EVP symmetric encryption, padding is always used __even if__
-      data size is a multiple of block size, in which case the padding
-      length is the block size. so we have the following:
-    */
-    
-    blks = (in_len / BLK_SIZE) + 1;
-
-    *data_out = (char *)g_malloc (blks * BLK_SIZE);
-
-    if (*data_out == NULL) {
-        g_warning ("failed to allocate the output buffer.\n");
-        goto enc_error;
-    }                
-
-    int update_len, final_len;
-
-    /* Do the encryption. */
-    ret = EVP_EncryptUpdate (&ctx,
-                             (unsigned char*)*data_out,
-                             &update_len,
-                             (unsigned char*)data_in,
-                             in_len);
-
-    if (ret == ENC_FAILURE)
-        goto enc_error;
-
-
-    /* Finish the possible partial block. */
-    ret = EVP_EncryptFinal_ex (&ctx,
-                               (unsigned char*)*data_out + update_len,
-                               &final_len);
-
-    *out_len = update_len + final_len;
-
-    /* out_len should be equal to the allocated buffer size. */
-    if (ret == ENC_FAILURE || *out_len != (blks * BLK_SIZE))
-        goto enc_error;
-    
-    EVP_CIPHER_CTX_cleanup (&ctx);
-
-    return 0;
-
-enc_error:
-
-    EVP_CIPHER_CTX_cleanup (&ctx);
-
-    *out_len = -1;
-
-    if (*data_out != NULL)
-        g_free (*data_out);
-
-    *data_out = NULL;
-
-    return -1;   
-}
-
-int
-ccnet_decrypt (char **data_out,
-               int *out_len,
-               const char *data_in,
-               const int in_len,
-               const char *code,
-               const int code_len)
-{
-    *data_out = NULL;
-    *out_len = -1;
-
-    /* Check validation. Because padding is always used, in_len must
-     * be a multiple of BLK_SIZE */
-    if ( data_in == NULL || in_len <= 0 || in_len % BLK_SIZE != 0 ||
-         code == NULL || code_len <= 0) {
-
-        g_warning ("Invalid param(s).\n");
-        return -1;
-    }
-
-    EVP_CIPHER_CTX ctx;
-    int ret, key_len;
-    unsigned char key[16], iv[16];
-
-   
-    /* Generate the derived key. We use AES 128 bits key,
-       Electroic-Code-Book cipher mode, and SHA1 as the message digest
-       when generating the key. IV is not used in ecb mode,
-       actually. */
-    key_len  = EVP_BytesToKey (EVP_aes_128_ecb(), /* cipher mode */
-                               EVP_sha1(),        /* message digest */
-                               NULL,              /* salt */
-                               (unsigned char*)code, /* passwd */
-                               code_len,
-                               3,   /* iteration times */
-                               key, /* the derived key */
-                               iv); /* IV, initial vector */
-
-    /* The key should be 16 bytes long for our 128 bit key. */
-    if (key_len != 16) {
-        g_warning ("failed to init EVP_CIPHER_CTX.\n");
-        return -1;
-    }
-
-
-    /* Prepare CTX for decryption. */
-    EVP_CIPHER_CTX_init (&ctx);
-
-    ret = EVP_DecryptInit_ex (&ctx,
-                              EVP_aes_128_ecb(), /* cipher mode */
-                              NULL, /* engine, NULL for default */
-                              key,  /* derived key */
-                              iv);  /* initial vector */
-
-    if (ret == DEC_FAILURE)
-        return -1;
-
-    /* Allocating output buffer. */
-    
-    *data_out = (char *)g_malloc (in_len);
-
-    if (*data_out == NULL) {
-        g_warning ("failed to allocate the output buffer.\n");
-        goto dec_error;
-    }                
-
-    int update_len, final_len;
-
-    /* Do the decryption. */
-    ret = EVP_DecryptUpdate (&ctx,
-                             (unsigned char*)*data_out,
-                             &update_len,
-                             (unsigned char*)data_in,
-                             in_len);
-
-    if (ret == DEC_FAILURE)
-        goto dec_error;
-
-
-    /* Finish the possible partial block. */
-    ret = EVP_DecryptFinal_ex (&ctx,
-                               (unsigned char*)*data_out + update_len,
-                               &final_len);
-
-    *out_len = update_len + final_len;
-
-    /* out_len should be smaller than in_len. */
-    if (ret == DEC_FAILURE || *out_len > in_len)
-        goto dec_error;
-
-    EVP_CIPHER_CTX_cleanup (&ctx);
-    
-    return 0;
-
-dec_error:
-
-    EVP_CIPHER_CTX_cleanup (&ctx);
-
-    *out_len = -1;
-    if (*data_out != NULL)
-        g_free (*data_out);
-
-    *data_out = NULL;
-
-    return -1;
-    
 }
 
 /* convert locale specific input to utf8 encoded string  */
@@ -2574,4 +2453,16 @@ is_permission_valid (const char *perm)
     }
 
     return strcmp (perm, "r") == 0 || strcmp (perm, "rw") == 0;
+}
+
+gboolean
+is_eml_file (const char *path)
+{
+    int len = strlen(path);
+    const char *ext;
+
+    if (len < 5)
+        return FALSE;
+    ext = &path[len-4];
+    return (strcasecmp (ext, ".eml") == 0);
 }

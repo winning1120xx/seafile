@@ -13,30 +13,19 @@ typedef struct _SeafCloneManager SeafCloneManager;
 
 enum {
     CLONE_STATE_INIT,
-    CLONE_STATE_CHECK_HTTP,
-    CLONE_STATE_CONNECT,
-    CLONE_STATE_CHECK_PROTOCOL,
-    CLONE_STATE_INDEX,
+    CLONE_STATE_CHECK_SERVER,
     CLONE_STATE_FETCH,
-    CLONE_STATE_CHECKOUT,
-    CLONE_STATE_MERGE,
     CLONE_STATE_DONE,
     CLONE_STATE_ERROR,
     CLONE_STATE_CANCEL_PENDING,
     CLONE_STATE_CANCELED,
+    /* States only used by non-http protocol. */
+    CLONE_STATE_CONNECT,
+    CLONE_STATE_CHECK_PROTOCOL,
+    CLONE_STATE_INDEX,
+    CLONE_STATE_CHECKOUT,
+    CLONE_STATE_MERGE,
     N_CLONE_STATES,
-};
-
-enum {
-    CLONE_OK,
-    CLONE_ERROR_CONNECT,
-    CLONE_ERROR_INDEX,
-    CLONE_ERROR_FETCH,
-    CLONE_ERROR_PASSWD,
-    CLONE_ERROR_CHECKOUT,
-    CLONE_ERROR_MERGE,
-    CLONE_ERROR_INTERNAL,
-    N_CLONE_ERRORS,
 };
 
 struct _CloneTask {
@@ -55,32 +44,31 @@ struct _CloneTask {
     char                *worktree;
     char                *passwd;
     int                  enc_version;
+    char                *repo_salt;
     char                *random_key;
     char                 root_id[41];
     gboolean             is_readonly;
+    /* Set to true when the local folder name is the same as library name.
+     * Worktree folder name will be kept in sync with library name if this is true.
+     */
+    gboolean             sync_wt_name;
 
     /* Http sync fields */
     char                *server_url;
     char                *effective_url;
     gboolean             use_fileserver_port;
     int                  http_protocol_version;
-    gboolean             http_sync;
     char                 server_head_id[41];
-
-    gboolean             server_side_merge;
 };
 
 const char *
 clone_task_state_to_str (int state);
 
-const char *
-clone_task_error_to_str (int error);
-
 struct _SeafCloneManager {
     struct _SeafileSession  *seaf;
     sqlite3                 *db;
     GHashTable              *tasks;
-    struct CcnetTimer       *check_timer;
+    struct SeafTimer       *check_timer;
 };
 
 SeafCloneManager *

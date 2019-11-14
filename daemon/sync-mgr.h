@@ -9,7 +9,7 @@ typedef struct _SyncTask SyncTask;
 typedef struct _SeafSyncManager SeafSyncManager;
 typedef struct _SeafSyncManagerPriv SeafSyncManagerPriv;
 
-struct CcnetTimer;
+struct SeafTimer;
 
 struct _SyncInfo {
     char       repo_id[41];     /* the repo */
@@ -27,6 +27,14 @@ struct _SyncInfo {
     gboolean   need_fetch;
     gboolean   need_upload;
     gboolean   need_merge;
+
+    /* Used by multipart upload. */
+    gboolean   multipart_upload;
+    gint64     total_bytes;
+    gint64     uploaded_bytes;
+    gboolean   end_multipart_upload;
+
+    gint       sync_perm_err_cnt;
 };
 
 enum {
@@ -42,33 +50,6 @@ enum {
     SYNC_STATE_NUM,
 };
 
-enum {
-    SYNC_ERROR_NONE,
-    SYNC_ERROR_RELAY_OFFLINE,
-    SYNC_ERROR_UPGRADE_REPO,
-    SYNC_ERROR_RELAY_REMOVED,
-    SYNC_ERROR_NOT_LOGIN,
-    SYNC_ERROR_SERVICE_DOWN,
-    SYNC_ERROR_ACCESS_DENIED,
-    SYNC_ERROR_QUOTA_FULL,
-    SYNC_ERROR_PROC_PERM_ERR,
-    SYNC_ERROR_DATA_CORRUPT,
-    SYNC_ERROR_START_UPLOAD,
-    SYNC_ERROR_UPLOAD,
-    SYNC_ERROR_START_FETCH,
-    SYNC_ERROR_FETCH,
-    SYNC_ERROR_NOREPO,
-    SYNC_ERROR_REPO_CORRUPT,
-    SYNC_ERROR_COMMIT,
-    SYNC_ERROR_MERGE,
-    SYNC_ERROR_WORKTREE_DIRTY,
-    SYNC_ERROR_DEPRECATED_SERVER,
-    SYNC_ERROR_GET_SYNC_INFO,   /* for http sync */
-    SYNC_ERROR_FILES_LOCKED,
-    SYNC_ERROR_UNKNOWN,
-    SYNC_ERROR_NUM,
-};
-
 struct _SyncTask {
     SeafSyncManager *mgr;
     SyncInfo        *info;
@@ -79,12 +60,10 @@ struct _SyncTask {
     int              error;
     char            *tx_id;
     char            *token;
-    struct CcnetTimer *commit_timer;
+    struct SeafTimer *commit_timer;
 
-    gboolean         server_side_merge;
     gboolean         uploaded;
 
-    gboolean         http_sync;
     int              http_version;
 
     SeafRepo        *repo;  /* for convenience, only valid when in_sync. */
@@ -114,7 +93,6 @@ struct _SeafSyncManager {
     gboolean    commit_job_running;
     int         sync_interval;
 
-    GHashTable *server_states;
     GHashTable *http_server_states;
 
     /* Sent/recv bytes from all transfer tasks in this second.
@@ -161,9 +139,6 @@ int
 seaf_sync_manager_is_auto_sync_enabled (SeafSyncManager *mgr);
 
 const char *
-sync_error_to_str (int error);
-
-const char *
 sync_state_to_str (int state);
 
 void
@@ -202,5 +177,10 @@ seaf_sync_manager_add_refresh_path (SeafSyncManager *mgr, const char *path);
 void
 seaf_sync_manager_refresh_path (SeafSyncManager *mgr, const char *path);
 #endif
+
+void
+seaf_sync_manager_set_task_error_code (SeafSyncManager *mgr,
+                                       const char *repo_id,
+                                       int error);
 
 #endif

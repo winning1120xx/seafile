@@ -6,6 +6,7 @@
 #include "seafile-session.h"
 #include "db.h"
 
+#define KEY_CLIENT_ID "client_id"
 #define KEY_CLIENT_NAME "client_name"
 
 #define KEY_MONITOR_ID  "monitor_id"
@@ -16,9 +17,11 @@
 #define KEY_DB_NAME "db_name"
 #define KEY_UPLOAD_LIMIT "upload_limit"
 #define KEY_DOWNLOAD_LIMIT "download_limit"
+#define KEY_CDC_AVERAGE_BLOCK_SIZE "block_size"
 #define KEY_ALLOW_INVALID_WORKTREE "allow_invalid_worktree"
 #define KEY_ALLOW_REPO_NOT_FOUND_ON_SERVER "allow_repo_not_found_on_server"
 #define KEY_SYNC_EXTRA_TEMP_FILE "sync_extra_temp_file"
+#define KEY_DISABLE_BLOCK_HASH "disable_block_hash"
 
 /* Http sync settings. */
 #define KEY_ENABLE_HTTP_SYNC "enable_http_sync"

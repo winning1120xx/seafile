@@ -22,12 +22,14 @@
 
 #define EMPTY_SHA1  "0000000000000000000000000000000000000000"
 
-#define CURRENT_ENC_VERSION 2
+#define CURRENT_ENC_VERSION 3
 
 #define DEFAULT_PROTO_VERSION 1
 #define CURRENT_PROTO_VERSION 7
 
 #define CURRENT_REPO_VERSION 1
+
+#define CURRENT_SYNC_PROTO_VERSION 2
 
 /* For compatibility with the old protocol, use an UUID for signature.
  * Listen manager on the server will use the new block tx protocol if it

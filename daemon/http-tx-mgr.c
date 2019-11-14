@@ -14,24 +14,27 @@
 #include <wincrypt.h>
 #endif
 
+#ifndef USE_GPL_CRYPTO
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 #include <openssl/bio.h>
+#include <openssl/asn1.h>
 #include <openssl/ssl.h>
-
-#include <ccnet/ccnet-client.h>
+#endif
 
 #include "seafile-config.h"
 
 #include "seafile-session.h"
 #include "http-tx-mgr.h"
 
-#include "seafile-error.h"
+#include "seafile-error-impl.h"
 #include "utils.h"
 #include "diff-simple.h"
 
 #define DEBUG_FLAG SEAFILE_DEBUG_TRANSFER
 #include "log.h"
+
+#include "timer.h"
 
 #define HTTP_OK 200
 #define HTTP_BAD_REQUEST 400
@@ -43,6 +46,8 @@
 #define HTTP_INTERNAL_SERVER_ERROR 500
 
 #define RESET_BYTES_INTERVAL_MSEC 1000
+
+#define CLEAR_POOL_ERR_CNT 3
 
 #ifndef SEAFILE_CLIENT_VERSION
 #define SEAFILE_CLIENT_VERSION PACKAGE_VERSION
@@ -60,6 +65,10 @@
 #define USER_AGENT_OS "Linux"
 #endif
 
+#if defined __FreeBSD__ || defined __NetBSD__ || defined __OpenBSD__ || defined __DragonFly__
+#define USER_AGENT_OS "BSD"
+#endif
+
 struct _Connection {
     CURL *curl;
     gint64 ctime;               /* Used to clean up unused connection. */
@@ -71,6 +80,7 @@ struct _ConnectionPool {
     char *host;
     GQueue *queue;
     pthread_mutex_t lock;
+    int err_cnt;
 };
 typedef struct _ConnectionPool ConnectionPool;
 
@@ -81,9 +91,13 @@ struct _HttpTxPriv {
     GHashTable *connection_pools; /* host -> connection pool */
     pthread_mutex_t pools_lock;
 
-    CcnetTimer *reset_bytes_timer;
+    SeafTimer *reset_bytes_timer;
 
     char *ca_bundle_path;
+
+    /* Regex to parse error message returned by update-branch. */
+    GRegex *locked_error_regex;
+    GRegex *folder_perm_error_regex;
 };
 typedef struct _HttpTxPriv HttpTxPriv;
 
@@ -116,6 +130,8 @@ http_tx_task_new (HttpTxManager *mgr,
     if (worktree)
         task->worktree = g_strdup(worktree);
 
+    task->error = SYNC_ERROR_ID_NO_ERROR;
+
     return task;
 }
 
@@ -127,10 +143,9 @@ http_tx_task_free (HttpTxTask *task)
     g_free (task->passwd);
     g_free (task->worktree);
     g_free (task->email);
+    g_free (task->repo_name);
     if (task->type == HTTP_TASK_TYPE_DOWNLOAD) {
         g_hash_table_destroy (task->blk_ref_cnts);
-        cevent_manager_unregister (seaf->ev_mgr, task->cevent_id);
-        g_free (task->repo_name);
     }
     g_free (task);
 }
@@ -150,22 +165,6 @@ static const char *http_task_rt_state_str[] = {
     "data",
     "update-branch",
     "finished",
-};
-
-static const char *http_task_error_strs[] = {
-    "Successful",
-    "Permission denied",
-    "Network error",
-    "Server error",
-    "Bad request",
-    "Internal data corrupt on the client",
-    "Not enough memory",
-    "Failed to write data on the client",
-    "Storage quota full",
-    "Files are locked by other application",
-    "Library deleted on server",
-    "Library damaged on server",
-    "Unknown error",
 };
 
 /* Http connection and connection pool. */
@@ -230,6 +229,19 @@ connection_pool_get_connection (ConnectionPool *pool)
 }
 
 static void
+connection_pool_clear (ConnectionPool *pool)
+{
+    Connection *conn = NULL;
+
+    while (1) {
+        conn = g_queue_pop_head (pool->queue);
+        if (!conn)
+            break;
+        connection_free (conn);
+    }
+}
+
+static void
 connection_pool_return_connection (ConnectionPool *pool, Connection *conn)
 {
     if (!conn)
@@ -237,15 +249,27 @@ connection_pool_return_connection (ConnectionPool *pool, Connection *conn)
 
     if (conn->release) {
         connection_free (conn);
+
+        pthread_mutex_lock (&pool->lock);
+        if (++pool->err_cnt >= CLEAR_POOL_ERR_CNT) {
+            connection_pool_clear (pool);
+        }
+        pthread_mutex_unlock (&pool->lock);
+
         return;
     }
 
     curl_easy_reset (conn->curl);
 
+    /* Reset error count when one connection succeeded. */
     pthread_mutex_lock (&pool->lock);
+    pool->err_cnt = 0;
     g_queue_push_tail (pool->queue, conn);
     pthread_mutex_unlock (&pool->lock);
 }
+
+#define LOCKED_ERROR_PATTERN "File (.+) is locked"
+#define FOLDER_PERM_ERROR_PATTERN "Update to path (.+) is not allowed by folder permission settings"
 
 HttpTxManager *
 http_tx_manager_new (struct _SeafileSession *seaf)
@@ -266,6 +290,19 @@ http_tx_manager_new (struct _SeafileSession *seaf)
     pthread_mutex_init (&priv->pools_lock, NULL);
 
     priv->ca_bundle_path = g_build_filename (seaf->seaf_dir, "ca-bundle.pem", NULL);
+
+    GError *error = NULL;
+    priv->locked_error_regex = g_regex_new (LOCKED_ERROR_PATTERN, 0, 0, &error);
+    if (error) {
+        seaf_warning ("Failed to create regex '%s': %s\n", LOCKED_ERROR_PATTERN, error->message);
+        g_clear_error (&error);
+    }
+
+    priv->folder_perm_error_regex = g_regex_new (FOLDER_PERM_ERROR_PATTERN, 0, 0, &error);
+    if (error) {
+        seaf_warning ("Failed to create regex '%s': %s\n", FOLDER_PERM_ERROR_PATTERN, error->message);
+        g_clear_error (&error);
+    }
 
     mgr->priv = priv;
 
@@ -301,8 +338,6 @@ reset_bytes (void *vdata)
 int
 http_tx_manager_start (HttpTxManager *mgr)
 {
-    curl_global_init (CURL_GLOBAL_ALL);
-
 #ifdef WIN32
     /* Remove existing ca-bundle file on start. */
     g_unlink (mgr->priv->ca_bundle_path);
@@ -310,53 +345,55 @@ http_tx_manager_start (HttpTxManager *mgr)
 
     /* TODO: add a timer to clean up unused Http connections. */
 
-    mgr->priv->reset_bytes_timer = ccnet_timer_new (reset_bytes,
-                                                    mgr,
-                                                    RESET_BYTES_INTERVAL_MSEC);
+    mgr->priv->reset_bytes_timer = seaf_timer_new (reset_bytes,
+                                                   mgr,
+                                                   RESET_BYTES_INTERVAL_MSEC);
 
     return 0;
 }
 
 /* Common Utility Functions. */
 
+#ifndef USE_GPL_CRYPTO
+
 #ifdef WIN32
 
-static void
-write_cert_name_to_pem_file (FILE *f, PCCERT_CONTEXT pc)
-{
-    char *name;
-    DWORD size;
+/* static void */
+/* write_cert_name_to_pem_file (FILE *f, PCCERT_CONTEXT pc) */
+/* { */
+/*     char *name; */
+/*     DWORD size; */
 
-    fprintf (f, "\n");
+/*     fprintf (f, "\n"); */
 
-    if (!CertGetCertificateContextProperty(pc,
-                                           CERT_FRIENDLY_NAME_PROP_ID,
-                                           NULL, &size)) {
-        return;
-    }
+/*     if (!CertGetCertificateContextProperty(pc, */
+/*                                            CERT_FRIENDLY_NAME_PROP_ID, */
+/*                                            NULL, &size)) { */
+/*         return; */
+/*     } */
 
-    name = g_malloc ((gsize)size);
-    if (!name) {
-        seaf_warning ("Failed to alloc memory\n");
-        return;
-    }
+/*     name = g_malloc ((gsize)size); */
+/*     if (!name) { */
+/*         seaf_warning ("Failed to alloc memory\n"); */
+/*         return; */
+/*     } */
 
-    if (!CertGetCertificateContextProperty(pc,
-                                           CERT_FRIENDLY_NAME_PROP_ID,
-                                           name, &size)) {
-        g_free (name);
-        return;
-    }
+/*     if (!CertGetCertificateContextProperty(pc, */
+/*                                            CERT_FRIENDLY_NAME_PROP_ID, */
+/*                                            name, &size)) { */
+/*         g_free (name); */
+/*         return; */
+/*     } */
 
-    if (fwrite(name, (size_t)size, 1, f) != 1) {
-        seaf_warning ("Failed to write pem file.\n");
-        g_free (name);
-        return;
-    }
-    fprintf (f, "\n");
+/*     if (fwrite(name, (size_t)size, 1, f) != 1) { */
+/*         seaf_warning ("Failed to write pem file.\n"); */
+/*         g_free (name); */
+/*         return; */
+/*     } */
+/*     fprintf (f, "\n"); */
 
-    g_free (name);
-}
+/*     g_free (name); */
+/* } */
 
 static void
 write_cert_to_pem_file (FILE *f, PCCERT_CONTEXT pc)
@@ -364,13 +401,19 @@ write_cert_to_pem_file (FILE *f, PCCERT_CONTEXT pc)
     const unsigned char *der = pc->pbCertEncoded;
     X509 *cert;
 
-    write_cert_name_to_pem_file (f, pc);
+    /* write_cert_name_to_pem_file (f, pc); */
 
     cert = d2i_X509 (NULL, &der, (int)pc->cbCertEncoded);
     if (!cert) {
         seaf_warning ("Failed to parse certificate from DER.\n");
         return;
     }
+
+    /* Don't add expired certs to pem file, otherwise openssl will
+     * complain certificate expired.
+     */
+    if (X509_cmp_current_time (X509_get_notAfter(cert)) < 0)
+        return;
 
     if (!PEM_write_X509 (f, cert)) {
         seaf_warning ("Failed to write certificate.\n");
@@ -382,22 +425,13 @@ write_cert_to_pem_file (FILE *f, PCCERT_CONTEXT pc)
 }
 
 static int
-create_ca_bundle (const char *ca_bundle_path)
+load_ca_from_store (FILE *f, const wchar_t *store_name)
 {
     HCERTSTORE store;
-    FILE *f;
 
-    store = CertOpenSystemStoreW (0, L"ROOT");
+    store = CertOpenSystemStoreW (0, store_name);
     if (!store) {
         seaf_warning ("Failed to open system cert store: %lu\n", GetLastError());
-        return -1;
-    }
-
-    f = g_fopen (ca_bundle_path, "w+b");
-    if (!f) {
-        seaf_warning ("Failed to open cabundle file %s: %s\n",
-                      ca_bundle_path, strerror(errno));
-        CertCloseStore(store, 0);
         return -1;
     }
 
@@ -410,9 +444,38 @@ create_ca_bundle (const char *ca_bundle_path)
     }
 
     CertCloseStore(store, 0);
-    fclose (f);
 
     return 0;
+}
+
+static int
+create_ca_bundle (const char *ca_bundle_path)
+{
+    FILE *f;
+    int ret = 0;
+
+    f = g_fopen (ca_bundle_path, "w+b");
+    if (!f) {
+        seaf_warning ("Failed to open cabundle file %s: %s\n",
+                      ca_bundle_path, strerror(errno));
+        return -1;
+    }
+
+    if (load_ca_from_store (f, L"ROOT") < 0) {
+        seaf_warning ("Failed to load ca from ROOT store.\n");
+        ret = -1;
+        goto out;
+    }
+
+    if (load_ca_from_store (f, L"CA") < 0) {
+        seaf_warning ("Failed to load ca from CA store.\n");
+        ret = -1;
+        goto out;
+    }
+
+out:
+    fclose (f);
+    return ret;
 }
 
 #endif	/* WIN32 */
@@ -532,6 +595,8 @@ ssl_callback (CURL *curl, void *ssl_ctx, void *userptr)
     return CURLE_OK;
 }
 
+#endif  /* USE_GPL_CRYPTO */
+
 static void
 set_proxy (CURL *curl, gboolean is_https)
 {
@@ -627,7 +692,9 @@ recv_response (void *contents, size_t size, size_t nmemb, void *userp)
     return realsize;
 }
 
-#define HTTP_TIMEOUT_SEC 120
+extern FILE *seafile_get_log_fp ();
+
+#define HTTP_TIMEOUT_SEC 300
 
 typedef size_t (*HttpRecvCallback) (void *, size_t, size_t, void *);
 
@@ -643,11 +710,16 @@ static int
 http_get (CURL *curl, const char *url, const char *token,
           int *rsp_status, char **rsp_content, gint64 *rsp_size,
           HttpRecvCallback callback, void *cb_data,
-          gboolean timeout)
+          gboolean timeout, int *pcurl_error)
 {
     char *token_header;
     struct curl_slist *headers = NULL;
     int ret = 0;
+
+    if (seafile_debug_flag_is_set (SEAFILE_DEBUG_CURL)) {
+        curl_easy_setopt (curl, CURLOPT_VERBOSE, 1);
+        curl_easy_setopt (curl, CURLOPT_STDERR, seafile_get_log_fp());
+    }
 
     headers = curl_slist_append (headers, "User-Agent: Seafile/"SEAFILE_CLIENT_VERSION" ("USER_AGENT_OS")");
 
@@ -688,14 +760,18 @@ http_get (CURL *curl, const char *url, const char *token,
 
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
+#ifndef USE_GPL_CRYPTO
 #if defined WIN32 || defined __APPLE__
     load_ca_bundle (curl);
 #endif
+#endif
 
+#ifndef USE_GPL_CRYPTO
     if (!seaf->disable_verify_certificate) {
         curl_easy_setopt (curl, CURLOPT_SSL_CTX_FUNCTION, ssl_callback);
         curl_easy_setopt (curl, CURLOPT_SSL_CTX_DATA, url);
     }
+#endif
 
 #ifdef WIN32
     curl_easy_setopt (curl, CURLOPT_SOCKOPTFUNCTION, sockopt_callback);
@@ -705,6 +781,8 @@ http_get (CURL *curl, const char *url, const char *token,
     if (rc != 0) {
         seaf_warning ("libcurl failed to GET %s: %s.\n",
                       url, curl_easy_strerror(rc));
+        if (pcurl_error)
+            *pcurl_error = rc;
         ret = -1;
         goto out;
     }
@@ -761,11 +839,16 @@ http_put (CURL *curl, const char *url, const char *token,
           const char *req_content, gint64 req_size,
           HttpSendCallback callback, void *cb_data,
           int *rsp_status, char **rsp_content, gint64 *rsp_size,
-          gboolean timeout)
+          gboolean timeout, int *pcurl_error)
 {
     char *token_header;
     struct curl_slist *headers = NULL;
     int ret = 0;
+
+    if (seafile_debug_flag_is_set (SEAFILE_DEBUG_CURL)) {
+        curl_easy_setopt (curl, CURLOPT_VERBOSE, 1);
+        curl_easy_setopt (curl, CURLOPT_STDERR, seafile_get_log_fp());
+    }
 
     headers = curl_slist_append (headers, "User-Agent: Seafile/"SEAFILE_CLIENT_VERSION" ("USER_AGENT_OS")");
     /* Disable the default "Expect: 100-continue" header */
@@ -823,14 +906,18 @@ http_put (CURL *curl, const char *url, const char *token,
 
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
+#ifndef USE_GPL_CRYPTO
 #if defined WIN32 || defined __APPLE__
     load_ca_bundle (curl);
 #endif
+#endif
 
+#ifndef USE_GPL_CRYPTO
     if (!seaf->disable_verify_certificate) {
         curl_easy_setopt (curl, CURLOPT_SSL_CTX_FUNCTION, ssl_callback);
         curl_easy_setopt (curl, CURLOPT_SSL_CTX_DATA, url);
     }
+#endif
 
 #ifdef WIN32
     curl_easy_setopt (curl, CURLOPT_SOCKOPTFUNCTION, sockopt_callback);
@@ -840,6 +927,8 @@ http_put (CURL *curl, const char *url, const char *token,
     if (rc != 0) {
         seaf_warning ("libcurl failed to PUT %s: %s.\n",
                       url, curl_easy_strerror(rc));
+        if (pcurl_error)
+            *pcurl_error = rc;
         ret = -1;
         goto out;
     }
@@ -870,13 +959,18 @@ static int
 http_post (CURL *curl, const char *url, const char *token,
            const char *req_content, gint64 req_size,
            int *rsp_status, char **rsp_content, gint64 *rsp_size,
-           gboolean timeout)
+           gboolean timeout, int *pcurl_error)
 {
     char *token_header;
     struct curl_slist *headers = NULL;
     int ret = 0;
 
     g_return_val_if_fail (req_content != NULL, -1);
+
+    if (seafile_debug_flag_is_set (SEAFILE_DEBUG_CURL)) {
+        curl_easy_setopt (curl, CURLOPT_VERBOSE, 1);
+        curl_easy_setopt (curl, CURLOPT_STDERR, seafile_get_log_fp());
+    }
 
     headers = curl_slist_append (headers, "User-Agent: Seafile/"SEAFILE_CLIENT_VERSION" ("USER_AGENT_OS")");
     /* Disable the default "Expect: 100-continue" header */
@@ -921,14 +1015,18 @@ http_post (CURL *curl, const char *url, const char *token,
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &rsp);
     }
 
+#ifndef USE_GPL_CRYPTO
 #if defined WIN32 || defined __APPLE__
     load_ca_bundle (curl);
 #endif
+#endif
 
+#ifndef USE_GPL_CRYPTO
     if (!seaf->disable_verify_certificate) {
         curl_easy_setopt (curl, CURLOPT_SSL_CTX_FUNCTION, ssl_callback);
         curl_easy_setopt (curl, CURLOPT_SSL_CTX_DATA, url);
     }
+#endif
 
     gboolean is_https = (strncasecmp(url, "https", strlen("https")) == 0);
     set_proxy (curl, is_https);
@@ -945,6 +1043,8 @@ http_post (CURL *curl, const char *url, const char *token,
     if (rc != 0) {
         seaf_warning ("libcurl failed to POST %s: %s.\n",
                       url, curl_easy_strerror(rc));
+        if (pcurl_error)
+            *pcurl_error = rc;
         ret = -1;
         goto out;
     }
@@ -971,25 +1071,70 @@ out:
     return ret;
 }
 
+static int
+http_error_to_http_task_error (int status)
+{
+    if (status == HTTP_BAD_REQUEST)
+        /* This is usually a bug in the client. Set to general error. */
+        return SYNC_ERROR_ID_GENERAL_ERROR;
+    else if (status == HTTP_FORBIDDEN)
+        return SYNC_ERROR_ID_ACCESS_DENIED;
+    else if (status >= HTTP_INTERNAL_SERVER_ERROR)
+        return SYNC_ERROR_ID_SERVER;
+    else if (status == HTTP_NOT_FOUND)
+        return SYNC_ERROR_ID_SERVER;
+    else if (status == HTTP_NO_QUOTA)
+        return SYNC_ERROR_ID_QUOTA_FULL;
+    else if (status == HTTP_REPO_DELETED)
+        return SYNC_ERROR_ID_SERVER_REPO_DELETED;
+    else if (status == HTTP_REPO_CORRUPTED)
+        return SYNC_ERROR_ID_SERVER_REPO_CORRUPT;
+    else
+        return SYNC_ERROR_ID_GENERAL_ERROR;
+}
+
 static void
 handle_http_errors (HttpTxTask *task, int status)
 {
-    if (status == HTTP_BAD_REQUEST)
-        task->error = HTTP_TASK_ERR_BAD_REQUEST;
-    else if (status == HTTP_FORBIDDEN)
-        task->error = HTTP_TASK_ERR_FORBIDDEN;
-    else if (status >= HTTP_INTERNAL_SERVER_ERROR)
-        task->error = HTTP_TASK_ERR_SERVER;
-    else if (status == HTTP_NOT_FOUND)
-        task->error = HTTP_TASK_ERR_SERVER;
-    else if (status == HTTP_NO_QUOTA)
-        task->error = HTTP_TASK_ERR_NO_QUOTA;
-    else if (status == HTTP_REPO_DELETED)
-        task->error = HTTP_TASK_ERR_REPO_DELETED;
-    else if (status == HTTP_REPO_CORRUPTED)
-        task->error = HTTP_TASK_ERR_REPO_CORRUPTED;
-    else
-        task->error = HTTP_TASK_ERR_UNKNOWN;
+    task->error = http_error_to_http_task_error (status);
+}
+
+static int
+curl_error_to_http_task_error (int curl_error)
+{
+    if (curl_error == CURLE_SSL_CACERT ||
+        curl_error == CURLE_PEER_FAILED_VERIFICATION)
+        return SYNC_ERROR_ID_SSL;
+
+    switch (curl_error) {
+    case CURLE_COULDNT_RESOLVE_PROXY:
+        return SYNC_ERROR_ID_RESOLVE_PROXY;
+    case CURLE_COULDNT_RESOLVE_HOST:
+        return SYNC_ERROR_ID_RESOLVE_HOST;
+    case CURLE_COULDNT_CONNECT:
+        return SYNC_ERROR_ID_CONNECT;
+    case CURLE_OPERATION_TIMEDOUT:
+        return SYNC_ERROR_ID_TX_TIMEOUT;
+    case CURLE_SSL_CONNECT_ERROR:
+    case CURLE_SSL_CERTPROBLEM:
+    case CURLE_SSL_CACERT_BADFILE:
+    case CURLE_SSL_ISSUER_ERROR:
+        return SYNC_ERROR_ID_SSL;
+    case CURLE_GOT_NOTHING:
+    case CURLE_SEND_ERROR:
+    case CURLE_RECV_ERROR:
+        return SYNC_ERROR_ID_TX;
+    case CURLE_SEND_FAIL_REWIND:
+        return SYNC_ERROR_ID_UNHANDLED_REDIRECT;
+    default:
+        return SYNC_ERROR_ID_NETWORK;
+    }
+}
+
+static void
+handle_curl_errors (HttpTxTask *task, int curl_error)
+{
+    task->error = curl_error_to_http_task_error (curl_error);
 }
 
 static void
@@ -1037,6 +1182,7 @@ typedef struct {
     gboolean success;
     gboolean not_supported;
     int version;
+    int error_code;
 } CheckProtocolData;
 
 static int
@@ -1097,8 +1243,10 @@ check_protocol_version_thread (void *vdata)
     else
         url = g_strdup_printf ("%s/protocol-version", data->host);
 
-    if (http_get (curl, url, NULL, &status, &rsp_content, &rsp_size, NULL, NULL, FALSE) < 0) {
+    int curl_error;
+    if (http_get (curl, url, NULL, &status, &rsp_content, &rsp_size, NULL, NULL, TRUE, &curl_error) < 0) {
         conn->release = TRUE;
+        data->error_code = curl_error_to_http_task_error (curl_error);
         goto out;
     }
 
@@ -1112,6 +1260,7 @@ check_protocol_version_thread (void *vdata)
     } else {
         seaf_warning ("Bad response code for GET %s: %d.\n", url, status);
         data->not_supported = TRUE;
+        data->error_code = http_error_to_http_task_error (status);
     }
 
 out:
@@ -1132,6 +1281,7 @@ check_protocol_version_done (void *vdata)
     result.check_success = data->success;
     result.not_supported = data->not_supported;
     result.version = data->version;
+    result.error_code = data->error_code;
 
     data->callback (&result, data->user_data);
 
@@ -1153,10 +1303,10 @@ http_tx_manager_check_protocol_version (HttpTxManager *manager,
     data->callback = callback;
     data->user_data = user_data;
 
-    int ret = ccnet_job_manager_schedule_job (seaf->job_mgr,
-                                              check_protocol_version_thread,
-                                              check_protocol_version_done,
-                                              data);
+    int ret = seaf_job_manager_schedule_job (seaf->job_mgr,
+                                             check_protocol_version_thread,
+                                             check_protocol_version_done,
+                                             data);
     if (ret < 0) {
         g_free (data->host);
         g_free (data);
@@ -1180,6 +1330,7 @@ typedef struct {
     gboolean is_corrupt;
     gboolean is_deleted;
     char head_commit[41];
+    int error_code;
 } CheckHeadData;
 
 static int
@@ -1249,9 +1400,11 @@ check_head_commit_thread (void *vdata)
         url = g_strdup_printf ("%s/repo/%s/commit/HEAD",
                                data->host, data->repo_id);
 
+    int curl_error;
     if (http_get (curl, url, data->token, &status, &rsp_content, &rsp_size,
-                  NULL, NULL, FALSE) < 0) {
+                  NULL, NULL, TRUE, &curl_error) < 0) {
         conn->release = TRUE;
+        data->error_code = curl_error_to_http_task_error (curl_error);
         goto out;
     }
 
@@ -1264,6 +1417,7 @@ check_head_commit_thread (void *vdata)
         data->success = TRUE;
     } else {
         seaf_warning ("Bad response code for GET %s: %d.\n", url, status);
+        data->error_code = http_error_to_http_task_error (status);
     }
 
 out:
@@ -1284,6 +1438,7 @@ check_head_commit_done (void *vdata)
     result.is_corrupt = data->is_corrupt;
     result.is_deleted = data->is_deleted;
     memcpy (result.head_commit, data->head_commit, 40);
+    result.error_code = data->error_code;
 
     data->callback (&result, data->user_data);
 
@@ -1312,10 +1467,10 @@ http_tx_manager_check_head_commit (HttpTxManager *manager,
     data->user_data = user_data;
     data->use_fileserver_port = use_fileserver_port;
 
-    if (ccnet_job_manager_schedule_job (seaf->job_mgr,
-                                        check_head_commit_thread,
-                                        check_head_commit_done,
-                                        data) < 0) {
+    if (seaf_job_manager_schedule_job (seaf->job_mgr,
+                                       check_head_commit_thread,
+                                       check_head_commit_done,
+                                       data) < 0) {
         g_free (data->host);
         g_free (data->token);
         g_free (data);
@@ -1604,7 +1759,7 @@ get_folder_perms_thread (void *vdata)
         goto out;
 
     if (http_post (curl, url, NULL, req_content, strlen(req_content),
-                   &status, &rsp_content, &rsp_size, FALSE) < 0) {
+                   &status, &rsp_content, &rsp_size, TRUE, NULL) < 0) {
         conn->release = TRUE;
         goto out;
     }
@@ -1666,10 +1821,10 @@ http_tx_manager_get_folder_perms (HttpTxManager *manager,
     data->user_data = user_data;
     data->use_fileserver_port = use_fileserver_port;
 
-    if (ccnet_job_manager_schedule_job (seaf->job_mgr,
-                                        get_folder_perms_thread,
-                                        get_folder_perms_done,
-                                        data) < 0) {
+    if (seaf_job_manager_schedule_job (seaf->job_mgr,
+                                       get_folder_perms_thread,
+                                       get_folder_perms_done,
+                                       data) < 0) {
         g_free (data->host);
         g_free (data);
         return -1;
@@ -1885,7 +2040,7 @@ get_locked_files_thread (void *vdata)
         goto out;
 
     if (http_post (curl, url, NULL, req_content, strlen(req_content),
-                   &status, &rsp_content, &rsp_size, FALSE) < 0) {
+                   &status, &rsp_content, &rsp_size, TRUE, NULL) < 0) {
         conn->release = TRUE;
         goto out;
     }
@@ -1942,10 +2097,10 @@ http_tx_manager_get_locked_files (HttpTxManager *manager,
     data->user_data = user_data;
     data->use_fileserver_port = use_fileserver_port;
 
-    if (ccnet_job_manager_schedule_job (seaf->job_mgr,
-                                        get_locked_files_thread,
-                                        get_locked_files_done,
-                                        data) < 0) {
+    if (seaf_job_manager_schedule_job (seaf->job_mgr,
+                                       get_locked_files_thread,
+                                       get_locked_files_done,
+                                       data) < 0) {
         g_free (data->host);
         g_free (data);
         return -1;
@@ -1994,7 +2149,7 @@ http_tx_manager_lock_file (HttpTxManager *manager,
     g_free (esc_path);
 
     if (http_put (curl, url, token, NULL, 0, NULL, NULL,
-                  &status, NULL, NULL, FALSE) < 0) {
+                  &status, NULL, NULL, TRUE, NULL) < 0) {
         conn->release = TRUE;
         ret = -1;
         goto out;
@@ -2049,7 +2204,7 @@ http_tx_manager_unlock_file (HttpTxManager *manager,
     g_free (esc_path);
 
     if (http_put (curl, url, token, NULL, 0, NULL, NULL,
-                  &status, NULL, NULL, FALSE) < 0) {
+                  &status, NULL, NULL, TRUE, NULL) < 0) {
         conn->release = TRUE;
         ret = -1;
         goto out;
@@ -2064,6 +2219,126 @@ out:
     g_free (url);
     connection_pool_return_connection (pool, conn);
     return ret;
+}
+
+static char *
+repo_id_list_to_json (GList *repo_id_list)
+{
+    json_t *array = json_array();
+    GList *ptr;
+    char *repo_id;
+
+    for (ptr = repo_id_list; ptr; ptr = ptr->next) {
+        repo_id = ptr->data;
+        json_array_append_new (array, json_string(repo_id));
+    }
+
+    char *data = json_dumps (array, JSON_COMPACT);
+    if (!data) {
+        seaf_warning ("Failed to dump json.\n");
+        json_decref (array);
+        return NULL;
+    }
+
+    json_decref (array);
+    return data;
+}
+
+static GHashTable *
+repo_head_commit_map_from_json (const char *json_str, gint64 len)
+{
+    json_t *object;
+    json_error_t jerror;
+    GHashTable *ret;
+
+    object = json_loadb (json_str, (size_t)len, 0, &jerror);
+    if (!object) {
+        seaf_warning ("Failed to load json: %s\n", jerror.text);
+        return NULL;
+    }
+
+    ret = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+
+    void *iter = json_object_iter (object);
+    const char *key;
+    json_t *value;
+    while (iter) {
+        key = json_object_iter_key (iter);
+        value = json_object_iter_value (iter);
+        if (json_typeof(value) != JSON_STRING) {
+            seaf_warning ("Bad json object format when parsing head commit id map.\n");
+            g_hash_table_destroy (ret);
+            goto out;
+        }
+        g_hash_table_replace (ret, g_strdup (key), g_strdup(json_string_value(value)));
+        iter = json_object_iter_next (object, iter);
+    }
+
+out:
+    json_decref (object);
+    return ret;
+}
+
+GHashTable *
+http_tx_manager_get_head_commit_ids (HttpTxManager *manager,
+                                     const char *host,
+                                     gboolean use_fileserver_port,
+                                     GList *repo_id_list)
+{
+    HttpTxPriv *priv = seaf->http_tx_mgr->priv;
+    ConnectionPool *pool;
+    Connection *conn;
+    CURL *curl;
+    char *url;
+    char *req_content = NULL;
+    gint64 req_size;
+    int status;
+    char *rsp_content = NULL;
+    gint64 rsp_size;
+    GHashTable *map = NULL;
+
+    pool = find_connection_pool (priv, host);
+    if (!pool) {
+        seaf_warning ("Failed to create connection pool for host %s.\n", host);
+        return NULL;
+    }
+
+    conn = connection_pool_get_connection (pool);
+    if (!conn) {
+        seaf_warning ("Failed to get connection to host %s.\n", host);
+        return NULL;
+    }
+
+    curl = conn->curl;
+
+    if (!use_fileserver_port)
+        url = g_strdup_printf ("%s/seafhttp/repo/head-commits-multi/", host);
+    else
+        url = g_strdup_printf ("%s/repo/head-commits-multi/", host);
+
+    req_content = repo_id_list_to_json (repo_id_list);
+    req_size = strlen(req_content);
+
+    if (http_post (curl, url, NULL, req_content, req_size,
+                   &status, &rsp_content, &rsp_size, TRUE, NULL) < 0) {
+        conn->release = TRUE;
+        goto out;
+    }
+
+    if (status != HTTP_OK) {
+        seaf_warning ("Bad response code for POST %s: %d\n", url, status);
+        goto out;
+    }
+
+    map = repo_head_commit_map_from_json (rsp_content, rsp_size);
+
+out:
+    g_free (url);
+    connection_pool_return_connection (pool, conn);
+    /* returned by json_dumps(). */
+    free (req_content);
+    g_free (rsp_content);
+    return map;
 }
 
 static gboolean
@@ -2094,7 +2369,12 @@ check_permission (HttpTxTask *task, Connection *conn)
     CURL *curl;
     char *url;
     int status;
+    char *rsp_content = NULL;
+    gint64 rsp_size;
     int ret = 0;
+    json_t *rsp_obj = NULL, *reason = NULL, *unsyncable_path = NULL;
+    const char *reason_str = NULL, *unsyncable_path_str = NULL;
+    json_error_t jerror;
 
     curl = conn->curl;
 
@@ -2106,28 +2386,75 @@ check_permission (HttpTxTask *task, Connection *conn)
         url = g_strdup_printf ("%s/%srepo/%s/permission-check/?op=%s"
                                "&client_id=%s&client_name=%s",
                                task->host, url_prefix, task->repo_id, type,
-                               seaf->session->base.id, client_name);
+                               seaf->client_id, client_name);
         g_free (client_name);
     } else {
         url = g_strdup_printf ("%s/%srepo/%s/permission-check/?op=%s",
                                task->host, url_prefix, task->repo_id, type);
     }
 
-    if (http_get (curl, url, task->token, &status, NULL, NULL, NULL, NULL, FALSE) < 0) {
+    int curl_error;
+    if (http_get (curl, url, task->token, &status, &rsp_content, &rsp_size, NULL, NULL, TRUE, &curl_error) < 0) {
         conn->release = TRUE;
-        task->error = HTTP_TASK_ERR_NET;
+        handle_curl_errors (task, curl_error);
         ret = -1;
         goto out;
     }
 
     if (status != HTTP_OK) {
         seaf_warning ("Bad response code for GET %s: %d.\n", url, status);
-        handle_http_errors (task, status);
+
+        if (status != HTTP_FORBIDDEN || !rsp_content) {
+            handle_http_errors (task, status);
+            ret = -1;
+            goto out;
+        }
+
+        rsp_obj = json_loadb (rsp_content, rsp_size, 0 ,&jerror);
+        if (!rsp_obj) {
+            seaf_warning ("Parse check permission response failed: %s.\n", jerror.text);
+            handle_http_errors (task, status);
+            json_decref (rsp_obj);
+            ret = -1;
+            goto out;
+        }
+
+        reason = json_object_get (rsp_obj, "reason");
+        if (!reason) {
+            handle_http_errors (task, status);
+            json_decref (rsp_obj);
+            ret = -1;
+            goto out;
+        }
+
+        reason_str = json_string_value (reason);
+        if (g_strcmp0 (reason_str, "no write permission") == 0) {
+            task->error = SYNC_ERROR_ID_NO_WRITE_PERMISSION;
+        } else if (g_strcmp0 (reason_str, "unsyncable share permission") == 0) {
+            task->error = SYNC_ERROR_ID_PERM_NOT_SYNCABLE;
+
+            unsyncable_path = json_object_get (rsp_obj, "unsyncable_path");
+            if (!unsyncable_path) {
+                json_decref (rsp_obj);
+                ret = -1;
+                goto out;
+            }
+
+            unsyncable_path_str = json_string_value (unsyncable_path);
+            if (unsyncable_path_str)
+                seaf_repo_manager_record_sync_error (task->repo_id, task->repo_name,
+                                                     unsyncable_path_str,
+                                                     SYNC_ERROR_ID_PERM_NOT_SYNCABLE);
+        } else {
+            task->error = SYNC_ERROR_ID_ACCESS_DENIED;
+        }
+
         ret = -1;
     }
 
 out:
     g_free (url);
+    g_free (rsp_content);
     curl_easy_reset (curl);
 
     return ret;
@@ -2174,14 +2501,16 @@ http_tx_manager_add_upload (HttpTxManager *manager,
 
     task->use_fileserver_port = use_fileserver_port;
 
+    task->repo_name = g_strdup(repo->name);
+
     g_hash_table_insert (manager->priv->upload_tasks,
                          g_strdup(repo_id),
                          task);
 
-    if (ccnet_job_manager_schedule_job (seaf->job_mgr,
-                                        http_upload_thread,
-                                        http_upload_done,
-                                        task) < 0) {
+    if (seaf_job_manager_schedule_job (seaf->job_mgr,
+                                       http_upload_thread,
+                                       http_upload_done,
+                                       task) < 0) {
         g_hash_table_remove (manager->priv->upload_tasks, repo_id);
         return -1;
     }
@@ -2346,9 +2675,10 @@ check_quota (HttpTxTask *task, Connection *conn, gint64 delta)
         url = g_strdup_printf ("%s/repo/%s/quota-check/?delta=%"G_GINT64_FORMAT"",
                                task->host, task->repo_id, delta);
 
-    if (http_get (curl, url, task->token, &status, NULL, NULL, NULL, NULL, FALSE) < 0) {
+    int curl_error;
+    if (http_get (curl, url, task->token, &status, NULL, NULL, NULL, NULL, TRUE, &curl_error) < 0) {
         conn->release = TRUE;
-        task->error = HTTP_TASK_ERR_NET;
+        handle_curl_errors (task, curl_error);
         ret = -1;
         goto out;
     }
@@ -2380,7 +2710,7 @@ send_commit_object (HttpTxTask *task, Connection *conn)
                                  task->repo_id, task->repo_version,
                                  task->head, (void**)&data, &len) < 0) {
         seaf_warning ("Failed to read commit %s.\n", task->head);
-        task->error = HTTP_TASK_ERR_BAD_LOCAL_DATA;
+        task->error = SYNC_ERROR_ID_LOCAL_DATA_CORRUPT;
         return -1;
     }
 
@@ -2393,12 +2723,13 @@ send_commit_object (HttpTxTask *task, Connection *conn)
         url = g_strdup_printf ("%s/repo/%s/commit/%s",
                                task->host, task->repo_id, task->head);
 
+    int curl_error;
     if (http_put (curl, url, task->token,
                   data, len,
                   NULL, NULL,
-                  &status, NULL, NULL, TRUE) < 0) {
+                  &status, NULL, NULL, TRUE, &curl_error) < 0) {
         conn->release = TRUE;
-        task->error = HTTP_TASK_ERR_NET;
+        handle_curl_errors (task, curl_error);
         ret = -1;
         goto out;
     }
@@ -2588,11 +2919,12 @@ upload_check_id_list_segment (HttpTxTask *task, Connection *conn, const char *ur
 
     curl = conn->curl;
 
+    int curl_error;
     if (http_post (curl, url, task->token,
                    data, len,
-                   &status, &rsp_content, &rsp_size, FALSE) < 0) {
+                   &status, &rsp_content, &rsp_size, TRUE, &curl_error) < 0) {
         conn->release = TRUE;
-        task->error = HTTP_TASK_ERR_NET;
+        handle_curl_errors (task, curl_error);
         ret = -1;
         goto out;
     }
@@ -2609,7 +2941,7 @@ upload_check_id_list_segment (HttpTxTask *task, Connection *conn, const char *ur
     array = json_loadb (rsp_content, rsp_size, 0, &jerror);
     if (!array) {
         seaf_warning ("Invalid JSON response from the server: %s.\n", jerror.text);
-        task->error = HTTP_TASK_ERR_SERVER;
+        task->error = SYNC_ERROR_ID_SERVER;
         ret = -1;
         goto out;
     }
@@ -2678,7 +3010,7 @@ send_fs_objects (HttpTxTask *task, Connection *conn, GList **send_fs_list)
                                      obj_id, (void **)&data, &len) < 0) {
             seaf_warning ("Failed to read fs object %s in repo %s.\n",
                           obj_id, task->repo_id);
-            task->error = HTTP_TASK_ERR_BAD_LOCAL_DATA;
+            task->error = SYNC_ERROR_ID_LOCAL_DATA_CORRUPT;
             ret = -1;
             goto out;
         }
@@ -2712,11 +3044,12 @@ send_fs_objects (HttpTxTask *task, Connection *conn, GList **send_fs_list)
         url = g_strdup_printf ("%s/repo/%s/recv-fs/",
                                task->host, task->repo_id);
 
+    int curl_error;
     if (http_post (curl, url, task->token,
                    (char *)package, evbuffer_get_length(buf),
-                   &status, NULL, NULL, FALSE) < 0) {
+                   &status, NULL, NULL, TRUE, &curl_error) < 0) {
         conn->release = TRUE;
-        task->error = HTTP_TASK_ERR_NET;
+        handle_curl_errors (task, curl_error);
         ret = -1;
         goto out;
     }
@@ -2925,7 +3258,7 @@ send_block_callback (void *ptr, size_t size, size_t nmemb, void *userp)
     if (n < 0) {
         seaf_warning ("Failed to read block %s in repo %.8s.\n",
                       data->block_id, task->repo_id);
-        task->error = HTTP_TASK_ERR_BAD_LOCAL_DATA;
+        task->error = SYNC_ERROR_ID_LOCAL_DATA_CORRUPT;
         return CURL_READFUNC_ABORT;
     }
 
@@ -2954,7 +3287,7 @@ send_block_callback (void *ptr, size_t size, size_t nmemb, void *userp)
 }
 
 static int
-send_block (HttpTxTask *task, Connection *conn, const char *block_id)
+send_block (HttpTxTask *task, Connection *conn, const char *block_id, guint32 *psize)
 {
     CURL *curl;
     char *url;
@@ -2969,6 +3302,7 @@ send_block (HttpTxTask *task, Connection *conn, const char *block_id)
     if (!bmd) {
         seaf_warning ("Failed to stat block %s in repo %s.\n",
                       block_id, task->repo_id);
+        task->error = SYNC_ERROR_ID_LOCAL_DATA_CORRUPT;
         return -1;
     }
 
@@ -2978,6 +3312,7 @@ send_block (HttpTxTask *task, Connection *conn, const char *block_id)
     if (!block) {
         seaf_warning ("Failed to open block %s in repo %s.\n",
                       block_id, task->repo_id);
+        task->error = SYNC_ERROR_ID_LOCAL_DATA_CORRUPT;
         g_free (bmd);
         return -1;
     }
@@ -2997,17 +3332,18 @@ send_block (HttpTxTask *task, Connection *conn, const char *block_id)
         url = g_strdup_printf ("%s/repo/%s/block/%s",
                                task->host, task->repo_id, block_id);
 
+    int curl_error;
     if (http_put (curl, url, task->token,
                   NULL, bmd->size,
                   send_block_callback, &data,
-                  &status, NULL, NULL, TRUE) < 0) {
+                  &status, NULL, NULL, TRUE, &curl_error) < 0) {
         if (task->state == HTTP_TASK_STATE_CANCELED)
             goto out;
 
-        if (task->error == HTTP_TASK_OK) {
+        if (task->error == SYNC_ERROR_ID_NO_ERROR) {
             /* Only release connection when it's a network error */
             conn->release = TRUE;
-            task->error = HTTP_TASK_ERR_NET;
+            handle_curl_errors (task, curl_error);
         }
         ret = -1;
         goto out;
@@ -3017,7 +3353,11 @@ send_block (HttpTxTask *task, Connection *conn, const char *block_id)
         seaf_warning ("Bad response code for PUT %s: %d.\n", url, status);
         handle_http_errors (task, status);
         ret = -1;
+        goto out;
     }
+
+    if (psize)
+        *psize = bmd->size;
 
 out:
     g_free (url);
@@ -3038,6 +3378,7 @@ typedef struct BlockUploadData {
 typedef struct BlockUploadTask {
     char block_id[41];
     int result;
+    guint32 block_size;
 } BlockUploadTask;
 
 static void
@@ -3058,12 +3399,12 @@ upload_block_thread_func (gpointer data, gpointer user_data)
     conn = connection_pool_get_connection (tx_data->cpool);
     if (!conn) {
         seaf_warning ("Failed to get connection to host %s.\n", http_task->host);
-        http_task->error = HTTP_TASK_ERR_NOT_ENOUGH_MEMORY;
+        http_task->error = SYNC_ERROR_ID_NOT_ENOUGH_MEMORY;
         ret = -1;
         goto out;
     }
 
-    ret = send_block (http_task, conn, task->block_id);
+    ret = send_block (http_task, conn, task->block_id, &task->block_size);
 
     connection_pool_return_connection (tx_data->cpool, conn);
 
@@ -3085,6 +3426,7 @@ multi_threaded_send_blocks (HttpTxTask *http_task, GList *block_list)
     GList *ptr;
     char *block_id;
     BlockUploadTask *task;
+    SyncInfo *info;
     int ret = 0;
 
     if (block_list == NULL)
@@ -3093,7 +3435,7 @@ multi_threaded_send_blocks (HttpTxTask *http_task, GList *block_list)
     cpool = find_connection_pool (priv, http_task->host);
     if (!cpool) {
         seaf_warning ("Failed to create connection pool for host %s.\n", http_task->host);
-        http_task->error = HTTP_TASK_ERR_NOT_ENOUGH_MEMORY;
+        http_task->error = SYNC_ERROR_ID_NOT_ENOUGH_MEMORY;
         return -1;
     }
 
@@ -3110,6 +3452,8 @@ multi_threaded_send_blocks (HttpTxTask *http_task, GList *block_list)
     pending_tasks = g_hash_table_new_full (g_str_hash, g_str_equal,
                                            g_free,
                                            (GDestroyNotify)block_upload_task_free);
+
+    info = seaf_sync_manager_get_sync_info (seaf->sync_mgr, http_task->repo_id);
 
     for (ptr = block_list; ptr; ptr = ptr->next) {
         block_id = ptr->data;
@@ -3134,6 +3478,10 @@ multi_threaded_send_blocks (HttpTxTask *http_task, GList *block_list)
 
         ++(http_task->done_blocks);
 
+        if (info && info->multipart_upload) {
+            info->uploaded_bytes += (gint64)task->block_size;
+        }
+
         g_hash_table_remove (pending_tasks, task->block_id);
         if (g_hash_table_size(pending_tasks) == 0)
             break;
@@ -3148,12 +3496,44 @@ multi_threaded_send_blocks (HttpTxTask *http_task, GList *block_list)
     return ret;
 }
 
+static void
+notify_permission_error (HttpTxTask *task, const char *error_str)
+{
+    HttpTxPriv *priv = seaf->http_tx_mgr->priv;
+    GMatchInfo *match_info;
+    char *path;
+
+    if (g_regex_match (priv->locked_error_regex, error_str, 0, &match_info)) {
+        path = g_match_info_fetch (match_info, 1);
+        seaf_repo_manager_record_sync_error (task->repo_id, task->repo_name, path,
+                                             SYNC_ERROR_ID_FILE_LOCKED);
+        g_free (path);
+
+        /* Set more accurate error. */
+        task->error = SYNC_ERROR_ID_FILE_LOCKED;
+    } else if (g_regex_match (priv->folder_perm_error_regex, error_str, 0, &match_info)) {
+        path = g_match_info_fetch (match_info, 1);
+        /* The path returned by server begins with '/'. */
+        seaf_repo_manager_record_sync_error (task->repo_id, task->repo_name,
+                                             (path[0] == '/') ? (path + 1) : path,
+                                             SYNC_ERROR_ID_FOLDER_PERM_DENIED);
+        g_free (path);
+
+        task->error = SYNC_ERROR_ID_FOLDER_PERM_DENIED;
+    }
+
+    g_match_info_free (match_info);
+}
+
 static int
 update_branch (HttpTxTask *task, Connection *conn)
 {
     CURL *curl;
     char *url;
     int status;
+    char *rsp_content;
+    char *rsp_content_str = NULL;
+    gint64 rsp_size;
     int ret = 0;
 
     curl = conn->curl;
@@ -3165,12 +3545,13 @@ update_branch (HttpTxTask *task, Connection *conn)
         url = g_strdup_printf ("%s/repo/%s/commit/HEAD/?head=%s",
                                task->host, task->repo_id, task->head);
 
+    int curl_error;
     if (http_put (curl, url, task->token,
                   NULL, 0,
                   NULL, NULL,
-                  &status, NULL, NULL, FALSE) < 0) {
+                  &status, &rsp_content, &rsp_size, TRUE, &curl_error) < 0) {
         conn->release = TRUE;
-        task->error = HTTP_TASK_ERR_NET;
+        handle_curl_errors (task, curl_error);
         ret = -1;
         goto out;
     }
@@ -3178,11 +3559,21 @@ update_branch (HttpTxTask *task, Connection *conn)
     if (status != HTTP_OK) {
         seaf_warning ("Bad response code for PUT %s: %d.\n", url, status);
         handle_http_errors (task, status);
+
+        if (status == HTTP_FORBIDDEN) {
+            rsp_content_str = g_new0 (gchar, rsp_size + 1);
+            memcpy (rsp_content_str, rsp_content, rsp_size);
+            seaf_warning ("%s\n", rsp_content_str);
+            notify_permission_error (task, rsp_content_str);
+            g_free (rsp_content_str);
+        }
+
         ret = -1;
     }
 
 out:
     g_free (url);
+    g_free (rsp_content);
     curl_easy_reset (curl);
 
     return ret;
@@ -3248,7 +3639,7 @@ http_upload_thread (void *vdata)
                                                         task->repo_id, "local");
     if (!local) {
         seaf_warning ("Failed to get branch local of repo %.8s.\n", task->repo_id);
-        task->error = HTTP_TASK_ERR_BAD_LOCAL_DATA;
+        task->error = SYNC_ERROR_ID_LOCAL_DATA_CORRUPT;
         return NULL;
     }
     memcpy (task->head, local->commit_id, 40);
@@ -3257,19 +3648,19 @@ http_upload_thread (void *vdata)
     pool = find_connection_pool (priv, task->host);
     if (!pool) {
         seaf_warning ("Failed to create connection pool for host %s.\n", task->host);
-        task->error = HTTP_TASK_ERR_NOT_ENOUGH_MEMORY;
+        task->error = SYNC_ERROR_ID_NOT_ENOUGH_MEMORY;
         goto out;
     }
 
     conn = connection_pool_get_connection (pool);
     if (!conn) {
         seaf_warning ("Failed to get connection to host %s.\n", task->host);
-        task->error = HTTP_TASK_ERR_NOT_ENOUGH_MEMORY;
+        task->error = SYNC_ERROR_ID_NOT_ENOUGH_MEMORY;
         goto out;
     }
 
-    seaf_message ("Upload with HTTP sync protocol version %d.\n",
-                  task->protocol_version);
+    /* seaf_message ("Upload with HTTP sync protocol version %d.\n", */
+    /*               task->protocol_version); */
 
     transition_state (task, task->state, HTTP_TASK_RT_STATE_CHECK);
 
@@ -3279,7 +3670,7 @@ http_upload_thread (void *vdata)
     if (calculate_upload_size_delta_and_active_paths (task, &delta, active_paths) < 0) {
         seaf_warning ("Failed to calculate upload size delta for repo %s.\n",
                       task->repo_id);
-        task->error = HTTP_TASK_ERR_BAD_LOCAL_DATA;
+        task->error = SYNC_ERROR_ID_LOCAL_DATA_CORRUPT;
         goto out;
     }
 
@@ -3316,7 +3707,7 @@ http_upload_thread (void *vdata)
     if (!send_fs_list) {
         seaf_warning ("Failed to calculate fs object list for repo %.8s.\n",
                       task->repo_id);
-        task->error = HTTP_TASK_ERR_BAD_LOCAL_DATA;
+        task->error = SYNC_ERROR_ID_LOCAL_DATA_CORRUPT;
         goto out;
     }
 
@@ -3355,7 +3746,7 @@ http_upload_thread (void *vdata)
     if (calculate_block_list (task, &block_list) < 0) {
         seaf_warning ("Failed to calculate block list for repo %.8s.\n",
                       task->repo_id);
-        task->error = HTTP_TASK_ERR_BAD_LOCAL_DATA;
+        task->error = SYNC_ERROR_ID_LOCAL_DATA_CORRUPT;
         goto out;
     }
 
@@ -3425,7 +3816,7 @@ http_upload_done (void *vdata)
 {
     HttpTxTask *task = vdata;
 
-    if (task->error != HTTP_TASK_OK)
+    if (task->error != SYNC_ERROR_ID_NO_ERROR)
         transition_state (task, HTTP_TASK_STATE_ERROR, HTTP_TASK_RT_STATE_FINISHED);
     else if (task->state == HTTP_TASK_STATE_CANCELED)
         transition_state (task, task->state, HTTP_TASK_RT_STATE_FINISHED);
@@ -3437,7 +3828,6 @@ http_upload_done (void *vdata)
 
 static void *http_download_thread (void *vdata);
 static void http_download_done (void *vdata);
-static void notify_conflict (CEvent *event, void *data);
 
 int
 http_tx_manager_add_download (HttpTxManager *manager,
@@ -3493,15 +3883,12 @@ http_tx_manager_add_download (HttpTxManager *manager,
                          g_strdup(repo_id),
                          task);
 
-    task->cevent_id = cevent_manager_register (seaf->ev_mgr,
-                                               (cevent_handler)notify_conflict,
-                                               NULL);
     task->repo_name = g_strdup(repo_name);
 
-    if (ccnet_job_manager_schedule_job (seaf->job_mgr,
-                                        http_download_thread,
-                                        http_download_done,
-                                        task) < 0) {
+    if (seaf_job_manager_schedule_job (seaf->job_mgr,
+                                       http_download_thread,
+                                       http_download_done,
+                                       task) < 0) {
         g_hash_table_remove (manager->priv->download_tasks, repo_id);
         return -1;
     }
@@ -3528,11 +3915,12 @@ get_commit_object (HttpTxTask *task, Connection *conn)
         url = g_strdup_printf ("%s/repo/%s/commit/%s",
                                task->host, task->repo_id, task->head);
 
+    int curl_error;
     if (http_get (curl, url, task->token, &status,
                   &rsp_content, &rsp_size,
-                  NULL, NULL, TRUE) < 0) {
+                  NULL, NULL, TRUE, &curl_error) < 0) {
         conn->release = TRUE;
-        task->error = HTTP_TASK_ERR_NET;
+        handle_curl_errors (task, curl_error);
         ret = -1;
         goto out;
     }
@@ -3553,7 +3941,7 @@ get_commit_object (HttpTxTask *task, Connection *conn)
     if (rc < 0) {
         seaf_warning ("Failed to save commit %s in repo %.8s.\n",
                       task->head, task->repo_id);
-        task->error = HTTP_TASK_ERR_WRITE_LOCAL_DATA;
+        task->error = SYNC_ERROR_ID_WRITE_LOCAL_DATA;
         ret = -1;
     }
 
@@ -3604,11 +3992,12 @@ get_needed_fs_id_list (HttpTxTask *task, Connection *conn, GList **fs_id_list)
 
     curl = conn->curl;
 
+    int curl_error;
     if (http_get (curl, url, task->token, &status,
                   &rsp_content, &rsp_size,
-                  NULL, NULL, FALSE) < 0) {
+                  NULL, NULL, (!task->is_clone), &curl_error) < 0) {
         conn->release = TRUE;
-        task->error = HTTP_TASK_ERR_NET;
+        handle_curl_errors (task, curl_error);
         ret = -1;
         goto out;
     }
@@ -3623,7 +4012,7 @@ get_needed_fs_id_list (HttpTxTask *task, Connection *conn, GList **fs_id_list)
     array = json_loadb (rsp_content, rsp_size, 0, &jerror);
     if (!array) {
         seaf_warning ("Invalid JSON response from the server: %s.\n", jerror.text);
-        task->error = HTTP_TASK_ERR_SERVER;
+        task->error = SYNC_ERROR_ID_SERVER;
         ret = -1;
         goto out;
     }
@@ -3742,11 +4131,12 @@ get_fs_objects (HttpTxTask *task, Connection *conn, GList **fs_list)
     else
         url = g_strdup_printf ("%s/repo/%s/pack-fs/", task->host, task->repo_id);
 
+    int curl_error;
     if (http_post (curl, url, task->token,
                    data, len,
-                   &status, &rsp_content, &rsp_size, FALSE) < 0) {
+                   &status, &rsp_content, &rsp_size, TRUE, &curl_error) < 0) {
         conn->release = TRUE;
-        task->error = HTTP_TASK_ERR_NET;
+        handle_curl_errors (task, curl_error);
         ret = -1;
         goto out;
     }
@@ -3774,7 +4164,7 @@ get_fs_objects (HttpTxTask *task, Connection *conn, GList **fs_list)
         if (n + sizeof(ObjectHeader) + size > rsp_size) {
             seaf_warning ("Incomplete object package received for repo %.8s.\n",
                           task->repo_id);
-            task->error = HTTP_TASK_ERR_SERVER;
+            task->error = SYNC_ERROR_ID_SERVER;
             ret = -1;
             goto out;
         }
@@ -3789,7 +4179,7 @@ get_fs_objects (HttpTxTask *task, Connection *conn, GList **fs_list)
         if (rc < 0) {
             seaf_warning ("Failed to write fs object %s in repo %.8s.\n",
                           recv_obj_id, task->repo_id);
-            task->error = HTTP_TASK_ERR_WRITE_LOCAL_DATA;
+            task->error = SYNC_ERROR_ID_WRITE_LOCAL_DATA;
             ret = -1;
             goto out;
         }
@@ -3850,7 +4240,7 @@ get_block_callback (void *ptr, size_t size, size_t nmemb, void *userp)
     if (n < realsize) {
         seaf_warning ("Failed to write block %s in repo %.8s.\n",
                       data->block_id, task->repo_id);
-        task->error = HTTP_TASK_ERR_BAD_LOCAL_DATA;
+        task->error = SYNC_ERROR_ID_WRITE_LOCAL_DATA;
         return n;
     }
 
@@ -3911,15 +4301,16 @@ get_block (HttpTxTask *task, Connection *conn, const char *block_id)
         url = g_strdup_printf ("%s/repo/%s/block/%s",
                                task->host, task->repo_id, block_id);
 
+    int curl_error;
     if (http_get (curl, url, task->token, &status, NULL, NULL,
-                  get_block_callback, &data, TRUE) < 0) {
+                  get_block_callback, &data, TRUE, &curl_error) < 0) {
         if (task->state == HTTP_TASK_STATE_CANCELED)
             goto error;
 
-        if (task->error == HTTP_TASK_OK) {
+        if (task->error == SYNC_ERROR_ID_NO_ERROR) {
             /* Only release the connection when it's a network error. */
             conn->release = TRUE;
-            task->error = HTTP_TASK_ERR_NET;
+            handle_curl_errors (task, curl_error);
         }
         ret = -1;
         goto error;
@@ -3932,9 +4323,19 @@ get_block (HttpTxTask *task, Connection *conn, const char *block_id)
         goto error;
     }
 
+    BlockMetadata *bmd = seaf_block_manager_stat_block_by_handle(seaf->block_mgr, block);
+    if (bmd == NULL) {
+        seaf_warning ("Failed to get block %s meta data in repo %.8s.\n", block_id, task->repo_id);
+        ret = -1;
+        goto error;
+    }
+    
     seaf_block_manager_close_block (seaf->block_mgr, block);
 
     pthread_mutex_lock (&task->ref_cnt_lock);
+
+    task->done_download += bmd->size;
+    g_free (bmd);    
 
     /* Don't overwrite the block if other thread already downloaded it.
      * Since we've locked ref_cnt_lock, we can be sure the block won't be removed.
@@ -3946,7 +4347,7 @@ get_block (HttpTxTask *task, Connection *conn, const char *block_id)
     {
         seaf_warning ("Failed to commit block %s in repo %.8s.\n",
                       block_id, task->repo_id);
-        task->error = HTTP_TASK_ERR_WRITE_LOCAL_DATA;
+        task->error = SYNC_ERROR_ID_WRITE_LOCAL_DATA;
         ret = -1;
     }
 
@@ -3998,7 +4399,7 @@ http_tx_task_download_file_blocks (HttpTxTask *task, const char *file_id)
     pool = find_connection_pool (priv, task->host);
     if (!pool) {
         seaf_warning ("Failed to create connection pool for host %s.\n", task->host);
-        task->error = HTTP_TASK_ERR_NOT_ENOUGH_MEMORY;
+        task->error = SYNC_ERROR_ID_NOT_ENOUGH_MEMORY;
         seafile_unref (file);
         return -1;
     }
@@ -4006,7 +4407,7 @@ http_tx_task_download_file_blocks (HttpTxTask *task, const char *file_id)
     conn = connection_pool_get_connection (pool);
     if (!conn) {
         seaf_warning ("Failed to get connection to host %s.\n", task->host);
-        task->error = HTTP_TASK_ERR_NOT_ENOUGH_MEMORY;
+        task->error = SYNC_ERROR_ID_NOT_ENOUGH_MEMORY;
         seafile_unref (file);
         return -1;
     }
@@ -4041,7 +4442,7 @@ update_local_repo (HttpTxTask *task)
                                                task->head);
     if (!new_head) {
         seaf_warning ("Failed to get commit %s:%s.\n", task->repo_id, task->head);
-        task->error = HTTP_TASK_ERR_BAD_LOCAL_DATA;
+        task->error = SYNC_ERROR_ID_LOCAL_DATA_CORRUPT;
         return -1;
     }
 
@@ -4056,7 +4457,7 @@ update_local_repo (HttpTxTask *task)
         repo = seaf_repo_new (new_head->repo_id, NULL, NULL);
         if (repo == NULL) {
             /* create repo failed */
-            task->error = HTTP_TASK_ERR_NOT_ENOUGH_MEMORY;
+            task->error = SYNC_ERROR_ID_NOT_ENOUGH_MEMORY;
             ret = -1;
             goto out;
         }
@@ -4075,7 +4476,7 @@ update_local_repo (HttpTxTask *task)
         seaf_branch_unref (branch);
     } else {
         if (!repo) {
-            task->error = HTTP_TASK_ERR_BAD_LOCAL_DATA;
+            task->error = SYNC_ERROR_ID_LOCAL_DATA_CORRUPT;
             ret = -1;
             goto out;
         }
@@ -4085,7 +4486,7 @@ update_local_repo (HttpTxTask *task)
                                                  "master");
         if (!branch) {
             seaf_warning ("Branch master not found for repo %.8s.\n", task->repo_id);
-            task->error = HTTP_TASK_ERR_BAD_LOCAL_DATA;
+            task->error = SYNC_ERROR_ID_LOCAL_DATA_CORRUPT;
             ret = -1;
             goto out;
         }
@@ -4096,6 +4497,9 @@ update_local_repo (HttpTxTask *task)
         /* Update repo head branch. */
         seaf_branch_set_commit (repo->head, new_head->commit_id);
         seaf_branch_manager_update_branch (seaf->branch_mgr, repo->head);
+
+        if (g_strcmp0 (repo->name, new_head->repo_name) != 0)
+            seaf_repo_set_name (repo, new_head->repo_name);
     }
 
 out:
@@ -4115,19 +4519,19 @@ http_download_thread (void *vdata)
     pool = find_connection_pool (priv, task->host);
     if (!pool) {
         seaf_warning ("Failed to create connection pool for host %s.\n", task->host);
-        task->error = HTTP_TASK_ERR_NOT_ENOUGH_MEMORY;
+        task->error = SYNC_ERROR_ID_NOT_ENOUGH_MEMORY;
         goto out;
     }
 
     conn = connection_pool_get_connection (pool);
     if (!conn) {
         seaf_warning ("Failed to get connection to host %s.\n", task->host);
-        task->error = HTTP_TASK_ERR_NOT_ENOUGH_MEMORY;
+        task->error = SYNC_ERROR_ID_NOT_ENOUGH_MEMORY;
         goto out;
     }
 
-    seaf_message ("Download with HTTP sync protocol version %d.\n",
-                  task->protocol_version);
+    /* seaf_message ("Download with HTTP sync protocol version %d.\n", */
+    /*               task->protocol_version); */
 
     transition_state (task, task->state, HTTP_TASK_RT_STATE_CHECK);
 
@@ -4183,19 +4587,19 @@ http_download_thread (void *vdata)
                                          REPO_PROP_DOWNLOAD_HEAD,
                                          task->head);
 
-    int rc = seaf_repo_fetch_and_checkout (NULL, task, TRUE, task->head);
+    int rc = seaf_repo_fetch_and_checkout (task, task->head);
     switch (rc) {
     case FETCH_CHECKOUT_SUCCESS:
         break;
     case FETCH_CHECKOUT_CANCELED:
         goto out;
     case FETCH_CHECKOUT_FAILED:
-        task->error = HTTP_TASK_ERR_WRITE_LOCAL_DATA;
+        task->error = SYNC_ERROR_ID_WRITE_LOCAL_DATA;
         goto out;
     case FETCH_CHECKOUT_TRANSFER_ERROR:
         goto out;
     case FETCH_CHECKOUT_LOCKED:
-        task->error = HTTP_TASK_ERR_FILES_LOCKED;
+        task->error = SYNC_ERROR_ID_FILE_LOCKED_BY_APP;
         goto out;
     }
 
@@ -4212,55 +4616,12 @@ http_download_done (void *vdata)
 {
     HttpTxTask *task = vdata;
 
-    if (task->error != HTTP_TASK_OK)
+    if (task->error != SYNC_ERROR_ID_NO_ERROR)
         transition_state (task, HTTP_TASK_STATE_ERROR, HTTP_TASK_RT_STATE_FINISHED);
     else if (task->state == HTTP_TASK_STATE_CANCELED)
         transition_state (task, task->state, HTTP_TASK_RT_STATE_FINISHED);
     else
         transition_state (task, HTTP_TASK_STATE_FINISHED, HTTP_TASK_RT_STATE_FINISHED);
-}
-
-typedef struct FileConflictData {
-    char *repo_id;
-    char *repo_name;
-    char *path;
-} FileConflictData;
-
-static void
-notify_conflict (CEvent *event, void *handler_data)
-{
-    FileConflictData *data = event->data;
-    json_t *object;
-    char *str;
-
-    object = json_object ();
-    json_object_set_new (object, "repo_id", json_string(data->repo_id));
-    json_object_set_new (object, "repo_name", json_string(data->repo_name));
-    json_object_set_new (object, "path", json_string(data->path));
-
-    str = json_dumps (object, 0);
-
-    seaf_mq_manager_publish_notification (seaf->mq_mgr,
-                                          "sync.conflict",
-                                          str);
-
-    free (str);
-    json_decref (object);
-    g_free (data->repo_id);
-    g_free (data->repo_name);
-    g_free (data->path);
-    g_free (data);
-}
-
-void
-http_tx_manager_notify_conflict (HttpTxTask *task, const char *path)
-{
-    FileConflictData *data = g_new0 (FileConflictData, 1);
-    data->repo_id = g_strdup(task->repo_id);
-    data->repo_name = g_strdup(task->repo_name);
-    data->path = g_strdup(path);
-
-    cevent_manager_add_event (seaf->ev_mgr, task->cevent_id, data);
 }
 
 GList*
@@ -4309,7 +4670,7 @@ http_tx_manager_cancel_task (HttpTxManager *manager,
     }
 
     if (task->runtime_state == HTTP_TASK_RT_STATE_INIT) {
-        transition_state (task, HTTP_TASK_STATE_CANCELED, TASK_RT_STATE_FINISHED);
+        transition_state (task, HTTP_TASK_STATE_CANCELED, HTTP_TASK_RT_STATE_FINISHED);
         return;
     }
 
@@ -4339,13 +4700,4 @@ http_task_rt_state_to_str (int rt_state)
         return "unknown";
 
     return http_task_rt_state_str[rt_state];
-}
-
-const char *
-http_task_error_str (int task_errno)
-{
-    if (task_errno < 0 || task_errno >= N_HTTP_TASK_ERROR)
-        return "unknown error";
-
-    return http_task_error_strs[task_errno];
 }

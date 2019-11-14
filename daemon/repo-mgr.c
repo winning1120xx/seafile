@@ -10,14 +10,11 @@
 
 #include <pthread.h>
 
-#include <ccnet.h>
 #include "utils.h"
 #define DEBUG_FLAG SEAFILE_DEBUG_SYNC
 #include "log.h"
 
-#include "status.h"
 #include "vc-utils.h"
-#include "merge.h"
 
 #include "seafile-session.h"
 #include "seafile-config.h"
@@ -29,11 +26,12 @@
 #include "seafile-crypt.h"
 #include "index/index.h"
 #include "index/cache-tree.h"
-#include "unpack-trees.h"
 #include "diff-simple.h"
 #include "change-set.h"
 
 #include "db.h"
+
+#include "seafile-object.h"
 
 #define INDEX_DIR "index"
 #define IGNORE_FILE "seafile-ignore.txt"
@@ -56,8 +54,6 @@ struct _SeafRepoManagerPriv {
     GHashTable *user_perms;     /* repo_id -> folder user perms */
     GHashTable *group_perms;    /* repo_id -> folder group perms */
     pthread_mutex_t perm_lock;
-
-    uint32_t cevent_id;         /* Used to notify sync error */
 
     GAsyncQueue *lock_office_job_queue;
 };
@@ -278,7 +274,8 @@ locked_file_set_remove (LockedFileSet *fset, const char *path, gboolean db_only)
     sqlite3_finalize (stmt);
     pthread_mutex_unlock (&mgr->priv->db_lock);
 
-    g_hash_table_remove (fset->locked_files, path);
+    if (!db_only)
+        g_hash_table_remove (fset->locked_files, path);
 
     return 0;
 }
@@ -667,31 +664,134 @@ is_repo_id_valid (const char *id)
     return is_uuid_valid (id);
 }
 
-#define SYNC_ERROR_ID_FILE_LOCKED_BY_APP 0
-#define SYNC_ERROR_ID_FOLDER_LOCKED_BY_APP 1
-#define SYNC_ERROR_ID_FILE_LOCKED 2
-#define SYNC_ERROR_ID_INVALID_PATH 3
-#define SYNC_ERROR_ID_INDEX_ERROR 4
+/*
+ * Sync error related. These functions should belong to the sync-mgr module.
+ * But since we have to store the errors in repo database, we have to put the code here.
+ */
 
-typedef struct SyncErrorData {
-    char *repo_id;
-    char *repo_name;
-    char *path;
-    int err_id;
-} SyncErrorData;
-
-static void
-notify_sync_error (CEvent *event, void *handler_data)
+int
+seaf_repo_manager_record_sync_error (const char *repo_id,
+                                     const char *repo_name,
+                                     const char *path,
+                                     int error_id)
 {
-    SyncErrorData *data = event->data;
+    char *sql;
+    int ret;
+
+    pthread_mutex_lock (&seaf->repo_mgr->priv->db_lock);
+
+    if (path != NULL)
+        sql = sqlite3_mprintf ("DELETE FROM FileSyncError WHERE repo_id='%q' AND path='%q'",
+                               repo_id, path);
+    else
+        sql = sqlite3_mprintf ("DELETE FROM FileSyncError WHERE repo_id='%q' AND path IS NULL",
+                               repo_id);
+    ret = sqlite_query_exec (seaf->repo_mgr->priv->db, sql);
+    sqlite3_free (sql);
+    if (ret < 0)
+        goto out;
+
+    /* REPLACE INTO will update the primary key id automatically.
+     * So new errors are always on top.
+     */
+    if (path != NULL)
+        sql = sqlite3_mprintf ("INSERT INTO FileSyncError "
+                               "(repo_id, repo_name, path, err_id, timestamp) "
+                               "VALUES ('%q', '%q', '%q', %d, %"G_GINT64_FORMAT")",
+                               repo_id, repo_name, path, error_id, (gint64)time(NULL));
+    else
+        sql = sqlite3_mprintf ("INSERT INTO FileSyncError "
+                               "(repo_id, repo_name, err_id, timestamp) "
+                               "VALUES ('%q', '%q', %d, %"G_GINT64_FORMAT")",
+                               repo_id, repo_name, error_id, (gint64)time(NULL));
+        
+    ret = sqlite_query_exec (seaf->repo_mgr->priv->db, sql);
+    sqlite3_free (sql);
+
+out:
+    pthread_mutex_unlock (&seaf->repo_mgr->priv->db_lock);
+    return ret;
+}
+
+static gboolean
+collect_file_sync_errors (sqlite3_stmt *stmt, void *data)
+{
+    GList **pret = data;
+    const char *repo_id, *repo_name, *path;
+    int id, err_id;
+    gint64 timestamp;
+    SeafileFileSyncError *error;
+
+    id = sqlite3_column_int (stmt, 0);
+    repo_id = (const char *)sqlite3_column_text (stmt, 1);
+    repo_name = (const char *)sqlite3_column_text (stmt, 2);
+    path = (const char *)sqlite3_column_text (stmt, 3);
+    err_id = sqlite3_column_int (stmt, 4);
+    timestamp = sqlite3_column_int64 (stmt, 5);
+
+    error = g_object_new (SEAFILE_TYPE_FILE_SYNC_ERROR,
+                          "id", id,
+                          "repo_id", repo_id,
+                          "repo_name", repo_name,
+                          "path", path,
+                          "err_id", err_id,
+                          "timestamp", timestamp,
+                          NULL);
+    *pret = g_list_prepend (*pret, error);
+
+    return TRUE;
+}
+
+GList *
+seaf_repo_manager_get_file_sync_errors (SeafRepoManager *mgr, int offset, int limit)
+{
+    GList *ret = NULL;
+    char *sql;
+
+    pthread_mutex_lock (&mgr->priv->db_lock);
+
+    sql = sqlite3_mprintf ("SELECT id, repo_id, repo_name, path, err_id, timestamp FROM "
+                           "FileSyncError ORDER BY id DESC LIMIT %d OFFSET %d",
+                           limit, offset);
+    sqlite_foreach_selected_row (mgr->priv->db, sql,
+                                 collect_file_sync_errors, &ret);
+    sqlite3_free (sql);
+
+    pthread_mutex_unlock (&mgr->priv->db_lock);
+
+    ret = g_list_reverse (ret);
+
+    return ret;
+}
+
+/*
+ * Record file-level sync errors and send system notification.
+ */
+void
+send_file_sync_error_notification (const char *repo_id,
+                                   const char *repo_name,
+                                   const char *path,
+                                   int err_id)
+{
+    if (!repo_name) {
+        SeafRepo *repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
+        if (!repo)
+            return;
+        repo_name = repo->name;
+    }
+
+    seaf_repo_manager_record_sync_error (repo_id, repo_name, path, err_id);
+
+    seaf_sync_manager_set_task_error_code (seaf->sync_mgr, repo_id, err_id);
+
     json_t *object;
     char *str;
 
     object = json_object ();
-    json_object_set_new (object, "repo_id", json_string(data->repo_id));
-    json_object_set_new (object, "repo_name", json_string(data->repo_name));
-    json_object_set_new (object, "path", json_string(data->path));
-    json_object_set_new (object, "err_id", json_integer(data->err_id));
+    json_object_set_new (object, "repo_id", json_string(repo_id));
+    json_object_set_new (object, "repo_name", json_string(repo_name));
+    json_object_set_new (object, "path", json_string(path));
+    json_object_set_new (object, "err_id", json_integer(err_id));
 
     str = json_dumps (object, 0);
 
@@ -701,32 +801,6 @@ notify_sync_error (CEvent *event, void *handler_data)
 
     free (str);
     json_decref (object);
-    g_free (data->repo_id);
-    g_free (data->repo_name);
-    g_free (data->path);
-    g_free (data);
-}
-
-static void
-send_sync_error_notification (const char *repo_id,
-                              const char *repo_name,
-                              const char *path,
-                              int err_id)
-{
-    if (!repo_name) {
-        SeafRepo *repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
-        if (!repo)
-            return;
-        repo_name = repo->name;
-    }
-
-    SyncErrorData *data = g_new0 (SyncErrorData, 1);
-    data->repo_id = g_strdup(repo_id);
-    data->repo_name = g_strdup(repo_name);
-    data->path = g_strdup(path);
-    data->err_id = err_id;
-
-    cevent_manager_add_event (seaf->ev_mgr, seaf->repo_mgr->priv->cevent_id, data);
 }
 
 SeafRepo*
@@ -871,6 +945,11 @@ seaf_repo_from_commit (SeafRepo *repo, SeafCommit *commit)
             memcpy (repo->magic, commit->magic, 64);
             memcpy (repo->random_key, commit->random_key, 96);
         }
+        else if (repo->enc_version == 3) {
+            memcpy (repo->magic, commit->magic, 64);
+            memcpy (repo->random_key, commit->random_key, 96);
+            memcpy (repo->salt, commit->salt, 64);
+        }
     }
     repo->no_local_history = commit->no_local_history;
     repo->version = commit->version;
@@ -890,9 +969,82 @@ seaf_repo_to_commit (SeafRepo *repo, SeafCommit *commit)
             commit->magic = g_strdup (repo->magic);
             commit->random_key = g_strdup (repo->random_key);
         }
+        else if (commit->enc_version == 3) {
+            commit->magic = g_strdup (repo->magic);
+            commit->random_key = g_strdup (repo->random_key);
+            commit->salt = g_strdup (repo->salt);
+        }
     }
     commit->no_local_history = repo->no_local_history;
     commit->version = repo->version;
+}
+
+static gboolean
+need_to_sync_worktree_name (const char *repo_id)
+{
+    char *need_sync_wt_name = seaf_repo_manager_get_repo_property (seaf->repo_mgr,
+                                                                   repo_id,
+                                                                   REPO_SYNC_WORKTREE_NAME);
+    gboolean ret = (g_strcmp0(need_sync_wt_name, "true") == 0);
+    g_free (need_sync_wt_name);
+    return ret;
+}
+
+static void
+update_repo_worktree_name (SeafRepo *repo, const char *new_name, gboolean rewatch)
+{
+    char *dirname = NULL, *basename = NULL;
+    char *new_worktree = NULL;
+
+    seaf_message ("Update worktree folder name of repo %s to %s.\n",
+                  repo->id, new_name);
+
+    dirname = g_path_get_dirname (repo->worktree);
+    if (g_strcmp0 (dirname, ".") == 0)
+        return;
+    basename = g_path_get_basename (repo->worktree);
+
+    new_worktree = g_build_filename (dirname, new_name, NULL);
+
+    /* This can possibly fail on Windows if some files are opened under the worktree.
+     * The rename operation will be retried on next restart.
+     */
+    if (seaf_util_rename (repo->worktree, new_worktree) < 0) {
+        seaf_warning ("Failed to rename worktree from %s to %s: %s.\n",
+                      repo->worktree, new_worktree, strerror(errno));
+        goto out;
+    }
+
+    if (seaf_repo_manager_set_repo_worktree (seaf->repo_mgr, repo, new_worktree) < 0) {
+        goto out;
+    }
+
+    if (rewatch) {
+        if (seaf_wt_monitor_unwatch_repo (seaf->wt_monitor, repo->id) < 0) {
+            seaf_warning ("Failed to unwatch repo %s old worktree.\n", repo->id);
+            goto out;
+        }
+
+        if (seaf_wt_monitor_watch_repo (seaf->wt_monitor, repo->id, repo->worktree) < 0) {
+            seaf_warning ("Failed to watch repo %s new worktree.\n", repo->id);
+        }
+    }
+
+out:
+    g_free (dirname);
+    g_free (basename);
+    g_free (new_worktree);
+}
+
+void
+seaf_repo_set_name (SeafRepo *repo, const char *new_name)
+{
+    char *old_name = repo->name;
+    repo->name = g_strdup(new_name);
+    g_free (old_name);
+
+    if (need_to_sync_worktree_name (repo->id))
+        update_repo_worktree_name (repo, new_name, TRUE);
 }
 
 static gboolean
@@ -974,64 +1126,6 @@ seaf_repo_manager_is_ignored_hidden_file (const char *filename)
     return FALSE;
 }
 
-static inline gboolean
-has_trailing_space_or_period (const char *path)
-{
-    int len = strlen(path);
-    if (path[len - 1] == ' ' || path[len - 1] == '.') {
-        return TRUE;
-    }
-
-    return FALSE;
-}
-
-static gboolean
-should_ignore_on_checkout (const char *file_path)
-{
-    gboolean ret = FALSE;
-
-#ifdef WIN32
-    static char illegals[] = {'\\', ':', '*', '?', '"', '<', '>', '|', '\b', '\t'};
-    char **components = g_strsplit (file_path, "/", -1);
-    int n_comps = g_strv_length (components);
-    int j = 0;
-    char *file_name;
-    int i;
-    char c;
-
-    for (; j < n_comps; ++j) {
-        file_name = components[j];
-
-        if (has_trailing_space_or_period (file_name)) {
-            /* Ignore files/dir whose path has trailing spaces. It would cause
-             * problem on windows. */
-            /* g_debug ("ignore '%s' which contains trailing space in path\n", path); */
-            ret = TRUE;
-            goto out;
-        }
-
-        for (i = 0; i < G_N_ELEMENTS(illegals); i++) {
-            if (strchr (file_name, illegals[i])) {
-                ret = TRUE;
-                goto out;
-            }
-        }
-
-        for (c = 1; c <= 31; c++) {
-            if (strchr (file_name, c)) {
-                ret = TRUE;
-                goto out;
-            }
-        }
-    }
-
-out:
-    g_strfreev (components);
-#endif
-
-    return ret;
-}
-
 static gboolean
 should_ignore(const char *basepath, const char *filename, void *data)
 {
@@ -1089,7 +1183,7 @@ index_cb (const char *repo_id,
 
     /* Check in blocks and get object ID. */
     if (seaf_fs_manager_index_blocks (seaf->fs_mgr, repo_id, version,
-                                      path, sha1, &size, crypt, write_data, TRUE) < 0) {
+                                      path, sha1, &size, crypt, write_data, !seaf->disable_block_hash) < 0) {
         seaf_warning ("Failed to index file %s.\n", path);
         return -1;
     }
@@ -1130,8 +1224,8 @@ add_file (const char *repo_id,
     is_locked = seaf_filelock_manager_is_file_locked (seaf->filelock_mgr,
                                                       repo_id, path);
     if (is_locked && options && !(options->startup_scan)) {
-        send_sync_error_notification (repo_id, NULL, path,
-                                      SYNC_ERROR_ID_FILE_LOCKED);
+        /* send_sync_error_notification (repo_id, NULL, path, */
+        /*                               SYNC_ERROR_ID_FILE_LOCKED); */
     }
 
     if (options && options->startup_scan) {
@@ -1150,12 +1244,16 @@ add_file (const char *repo_id,
                                                   path,
                                                   S_IFREG,
                                                   status);
+        /* send an error notification for read-only repo when modifying a file. */
+        if (status == SYNC_STATUS_SYNCING && !is_writable)
+            send_file_sync_error_notification (repo_id, NULL, path,
+                                               SYNC_ERROR_ID_UPDATE_TO_READ_ONLY_REPO);
     }
 
     if (!is_writable || is_locked)
         return ret;
 
-#ifdef WIN32
+#if defined WIN32 || defined __APPLE__
     if (options && options->fset) {
         LockedFile *file = locked_file_set_lookup (options->fset, path);
         if (file) {
@@ -1184,17 +1282,20 @@ add_file (const char *repo_id,
                                                   path,
                                                   S_IFREG,
                                                   SYNC_STATUS_SYNCED);
-        }
-        if (added && options && options->changeset) {
-            /* ce may be updated. */
-            ce = index_name_exists (istate, path, strlen(path), 0);
-            add_to_changeset (options->changeset,
-                              DIFF_STATUS_ADDED,
-                              ce->sha1,
-                              st,
-                              modifier,
-                              path,
-                              NULL);
+        } else {
+            if (total_size)
+                *total_size += (gint64)(st->st_size);
+            if (options && options->changeset) {
+                /* ce may be updated. */
+                ce = index_name_exists (istate, path, strlen(path), 0);
+                add_to_changeset (options->changeset,
+                                  DIFF_STATUS_ADDED,
+                                  ce->sha1,
+                                  st,
+                                  modifier,
+                                  path,
+                                  NULL);
+            }
         }
     } else if (*remain_files == NULL) {
         ret = add_to_index (repo_id, version, istate, path, full_path,
@@ -1221,8 +1322,10 @@ add_file (const char *repo_id,
                               path,
                               NULL);
         }
-    } else
+    } else {
+        *total_size += (gint64)(st->st_size);
         g_queue_push_tail (*remain_files, g_strdup(path));
+    }
 
     if (ret < 0) {
         seaf_sync_manager_update_active_path (seaf->sync_mgr,
@@ -1230,8 +1333,8 @@ add_file (const char *repo_id,
                                               path,
                                               S_IFREG,
                                               SYNC_STATUS_ERROR);
-        /* send_sync_error_notification (repo_id, NULL, path, */
-        /*                               SYNC_ERROR_ID_INDEX_ERROR); */
+        send_file_sync_error_notification (repo_id, NULL, path,
+                                           SYNC_ERROR_ID_INDEX_ERROR);
     }
 
     return ret;
@@ -1517,6 +1620,9 @@ iter_dir_cb (wchar_t *full_parent_w,
     int ret = 0;
 
     dname = g_utf16_to_utf8 (fdata->cFileName, -1, NULL, NULL, NULL);
+    if (!dname) {
+        goto out;
+    }
 
     path = g_build_path ("/", data->parent, dname, NULL);
     full_path = g_build_path ("/", params->worktree, path, NULL);
@@ -1744,7 +1850,7 @@ is_empty_dir (const char *path, GList *ignore_list)
             continue;
 
         dname = g_utf16_to_utf8 (fdata.cFileName, -1, NULL, NULL, NULL);
-        if (!should_ignore (path, dname, ignore_list)) {
+        if (!dname || !should_ignore (path, dname, ignore_list)) {
             ret = FALSE;
             g_free (dname);
             FindClose (handle);
@@ -1773,7 +1879,7 @@ out:
 static gboolean
 check_locked_file_before_remove (LockedFileSet *fset, const char *path)
 {
-#ifdef WIN32
+#if defined WIN32 || defined __APPLE__
     if (!fset)
         return TRUE;
 
@@ -1842,8 +1948,7 @@ remove_deleted (struct index_state *istate, const char *worktree, const char *pr
                                                DIFF_STATUS_DIR_DELETED,
                                                ce->name,
                                                TRUE,
-                                               prefix,
-                                               TRUE);
+                                               prefix);
                 } else if (!is_empty_dir (path, ignore_list)) {
                     /* Don't add to changeset if empty dir became non-empty. */
                     ce->ce_flags |= CE_REMOVE;
@@ -1864,8 +1969,7 @@ remove_deleted (struct index_state *istate, const char *worktree, const char *pr
                                            DIFF_STATUS_DELETED,
                                            ce->name,
                                            TRUE,
-                                           prefix,
-                                           TRUE);
+                                           prefix);
             }
         }
     }
@@ -1924,8 +2028,6 @@ out:
     g_strfreev (tokens);
     return ret;
 }
-
-#ifndef __APPLE__
 
 static int
 add_path_to_index (SeafRepo *repo, struct index_state *istate,
@@ -1987,6 +2089,9 @@ add_path_to_index (SeafRepo *repo, struct index_state *istate,
     full_path = g_build_filename (repo->worktree, path, NULL);
 
     if (seaf_stat (full_path, &st) < 0) {
+        if (errno != ENOENT)
+            send_file_sync_error_notification (repo->id, repo->name, path,
+                                               SYNC_ERROR_ID_INDEX_ERROR);
         seaf_warning ("Failed to stat %s: %s.\n", path, strerror(errno));
         g_free (full_path);
         return -1;
@@ -2008,7 +2113,7 @@ add_path_to_index (SeafRepo *repo, struct index_state *istate,
     return 0;
 }
 
-#else
+#if 0
 
 static int
 add_path_to_index (SeafRepo *repo, struct index_state *istate,
@@ -2016,8 +2121,6 @@ add_path_to_index (SeafRepo *repo, struct index_state *istate,
                    GList **scanned_dirs, gint64 *total_size, GQueue **remain_files,
                    LockedFileSet *fset)
 {
-    SeafStat st;
-
     /* If we've recursively scanned the parent directory, don't need to scan
      * any files under it any more.
      */
@@ -2130,8 +2233,8 @@ add_remain_files (SeafRepo *repo, struct index_state *istate,
                                                       path,
                                                       S_IFREG,
                                                       SYNC_STATUS_ERROR);
-                /* send_sync_error_notification (repo->id, NULL, path, */
-                /*                               SYNC_ERROR_ID_INDEX_ERROR); */
+                send_file_sync_error_notification (repo->id, NULL, path,
+                                                   SYNC_ERROR_ID_INDEX_ERROR);
             }
         } else if (S_ISDIR(st.st_mode)) {
             if (is_empty_dir (full_path, ignore_list)) {
@@ -2225,6 +2328,11 @@ try_add_empty_parent_dir_entry_from_wt (const char *worktree,
         }
 
         char *utf8_path = g_utf16_to_utf8 (long_path, -1, NULL, NULL, NULL);
+        if (!utf8_path) {
+            g_free (long_path);
+            goto out;
+        }
+
         char *p;
         for (p = utf8_path; *p != 0; ++p)
             if (*p == '\\')
@@ -2292,7 +2400,7 @@ scan_subtree_for_deletion (const char *repo_id,
                            GList **scanned_dirs,
                            ChangeSet *changeset)
 {
-    wchar_t *path_w;
+    wchar_t *path_w = NULL;
     wchar_t *dir_w = NULL;
     wchar_t *p;
     char *dir = NULL;
@@ -2326,6 +2434,9 @@ scan_subtree_for_deletion (const char *repo_id,
         dir_w = wcsdup(L"");
 
     dir = g_utf16_to_utf8 (dir_w, -1, NULL, NULL, NULL);
+    if (!dir)
+        goto out;
+
     for (p2 = dir; *p2 != 0; ++p2)
         if (*p2 == '\\')
             *p2 = '/';
@@ -2411,6 +2522,8 @@ handle_add_files (SeafRepo *repo, struct index_state *istate,
                   WTStatus *status, WTEvent *event,
                   GList **scanned_dirs, gint64 *total_size)
 {
+    SyncInfo *info;
+
     if (!repo->create_partial_commit) {
         /* XXX: We now use remain_files = NULL to signify not creating
          * partial commits. It's better to use total_size = NULL for
@@ -2450,6 +2563,12 @@ handle_add_files (SeafRepo *repo, struct index_state *istate,
                 pthread_mutex_lock (&status->q_lock);
                 g_queue_push_head (status->event_q, event);
                 pthread_mutex_unlock (&status->q_lock);
+
+                info = seaf_sync_manager_get_sync_info (seaf->sync_mgr, repo->id);
+                if (!info->multipart_upload) {
+                    info->multipart_upload = TRUE;
+                    info->total_bytes = *total_size;
+                }
             }
 
             return TRUE;
@@ -2464,6 +2583,10 @@ handle_add_files (SeafRepo *repo, struct index_state *istate,
             g_queue_push_head (status->event_q, event);
             pthread_mutex_unlock (&status->q_lock);
             return TRUE;
+        } else {
+            info = seaf_sync_manager_get_sync_info (seaf->sync_mgr, repo->id);
+            info->end_multipart_upload = TRUE;
+            return TRUE;
         }
         if (*total_size >= MAX_COMMIT_SIZE)
             return TRUE;
@@ -2474,157 +2597,157 @@ handle_add_files (SeafRepo *repo, struct index_state *istate,
 
 #ifdef __APPLE__
 
-struct _WTDirent {
-    char *dname;
-    struct stat st;
-};
-typedef struct _WTDirent WTDirent;
+/* struct _WTDirent { */
+/*     char *dname; */
+/*     struct stat st; */
+/* }; */
+/* typedef struct _WTDirent WTDirent; */
 
-static gint
-compare_wt_dirents (gconstpointer a, gconstpointer b)
-{
-    const WTDirent *dent_a = a, *dent_b = b;
+/* static gint */
+/* compare_wt_dirents (gconstpointer a, gconstpointer b) */
+/* { */
+/*     const WTDirent *dent_a = a, *dent_b = b; */
 
-    return (strcmp (dent_a->dname, dent_b->dname));
-}
+/*     return (strcmp (dent_a->dname, dent_b->dname)); */
+/* } */
 
-static GList *
-get_sorted_wt_dirents (const char *dir_path, const char *full_dir_path,
-                       gboolean *error)
-{
-    GDir *dir;
-    GError *err = NULL;
-    const char *name;
-    char *dname;
-    char *full_sub_path, *sub_path;
-    WTDirent *dent;
-    GList *ret = NULL;
+/* static GList * */
+/* get_sorted_wt_dirents (const char *dir_path, const char *full_dir_path, */
+/*                        gboolean *error) */
+/* { */
+/*     GDir *dir; */
+/*     GError *err = NULL; */
+/*     const char *name; */
+/*     char *dname; */
+/*     char *full_sub_path, *sub_path; */
+/*     WTDirent *dent; */
+/*     GList *ret = NULL; */
 
-    dir = g_dir_open (full_dir_path, 0, &err);
-    if (!dir) {
-        seaf_warning ("Failed to open dir %s: %s.\n", full_dir_path, err->message);
-        *error = TRUE;
-        return NULL;
-    }
+/*     dir = g_dir_open (full_dir_path, 0, &err); */
+/*     if (!dir) { */
+/*         seaf_warning ("Failed to open dir %s: %s.\n", full_dir_path, err->message); */
+/*         *error = TRUE; */
+/*         return NULL; */
+/*     } */
 
-    while ((name = g_dir_read_name(dir)) != NULL) {
-        dname = g_utf8_normalize (name, -1, G_NORMALIZE_NFC);
-        sub_path = g_strconcat (dir_path, "/", dname, NULL);
-        full_sub_path = g_strconcat (full_dir_path, "/", dname, NULL);
+/*     while ((name = g_dir_read_name(dir)) != NULL) { */
+/*         dname = g_utf8_normalize (name, -1, G_NORMALIZE_NFC); */
+/*         sub_path = g_strconcat (dir_path, "/", dname, NULL); */
+/*         full_sub_path = g_strconcat (full_dir_path, "/", dname, NULL); */
 
-        dent = g_new0 (WTDirent, 1);
-        dent->dname = dname;
+/*         dent = g_new0 (WTDirent, 1); */
+/*         dent->dname = dname; */
 
-        if (stat (full_sub_path, &dent->st) < 0) {
-            seaf_warning ("Failed to stat %s: %s.\n", full_sub_path, strerror(errno));
-            g_free (dname);
-            g_free (sub_path);
-            g_free (full_sub_path);
-            g_free (dent);
-            continue;
-        }
+/*         if (stat (full_sub_path, &dent->st) < 0) { */
+/*             seaf_warning ("Failed to stat %s: %s.\n", full_sub_path, strerror(errno)); */
+/*             g_free (dname); */
+/*             g_free (sub_path); */
+/*             g_free (full_sub_path); */
+/*             g_free (dent); */
+/*             continue; */
+/*         } */
 
-        ret = g_list_prepend (ret, dent);
+/*         ret = g_list_prepend (ret, dent); */
 
-        g_free (sub_path);
-        g_free (full_sub_path);
-    }
+/*         g_free (sub_path); */
+/*         g_free (full_sub_path); */
+/*     } */
 
-    g_dir_close (dir);
+/*     g_dir_close (dir); */
 
-    ret = g_list_sort (ret, compare_wt_dirents);
-    return ret;
-}
+/*     ret = g_list_sort (ret, compare_wt_dirents); */
+/*     return ret; */
+/* } */
 
-static void
-wt_dirent_free (WTDirent *dent)
-{
-    if (!dent)
-        return;
-    g_free (dent->dname);
-    g_free (dent);
-}
+/* static void */
+/* wt_dirent_free (WTDirent *dent) */
+/* { */
+/*     if (!dent) */
+/*         return; */
+/*     g_free (dent->dname); */
+/*     g_free (dent); */
+/* } */
 
-inline static char *
-concat_sub_path (const char *dir, const char *dname)
-{
-    if (dir[0] != 0)
-        return g_strconcat(dir, "/", dname, NULL);
-    else
-        return g_strdup(dname);
-}
+/* inline static char * */
+/* concat_sub_path (const char *dir, const char *dname) */
+/* { */
+/*     if (dir[0] != 0) */
+/*         return g_strconcat(dir, "/", dname, NULL); */
+/*     else */
+/*         return g_strdup(dname); */
+/* } */
 
-static int
-get_changed_paths_in_folder (SeafRepo *repo, struct index_state *istate,
-                             const char *dir_path,
-                             GList **add, GList **mod, GList **del)
-{
-    char *full_dir_path;
-    GList *wt_dents = NULL, *index_dents = NULL;
-    gboolean error = FALSE;
+/* static int */
+/* get_changed_paths_in_folder (SeafRepo *repo, struct index_state *istate, */
+/*                              const char *dir_path, */
+/*                              GList **add, GList **mod, GList **del) */
+/* { */
+/*     char *full_dir_path; */
+/*     GList *wt_dents = NULL, *index_dents = NULL; */
+/*     gboolean error = FALSE; */
 
-    full_dir_path = g_build_filename(repo->worktree, dir_path, NULL);
+/*     full_dir_path = g_build_filename(repo->worktree, dir_path, NULL); */
 
-    wt_dents = get_sorted_wt_dirents (dir_path, full_dir_path, &error);
-    if (error) {
-        g_free (full_dir_path);
-        return -1;
-    }
+/*     wt_dents = get_sorted_wt_dirents (dir_path, full_dir_path, &error); */
+/*     if (error) { */
+/*         g_free (full_dir_path); */
+/*         return -1; */
+/*     } */
 
-    index_dents = list_dirents_from_index (istate, dir_path);
+/*     index_dents = list_dirents_from_index (istate, dir_path); */
 
-    GList *p;
-    IndexDirent *dent;
-    for (p = index_dents; p; p = p->next) {
-        dent = p->data;
-    }
+/*     GList *p; */
+/*     IndexDirent *dent; */
+/*     for (p = index_dents; p; p = p->next) { */
+/*         dent = p->data; */
+/*     } */
 
-    GList *p1 = wt_dents, *p2 = index_dents;
-    WTDirent *dent1;
-    IndexDirent *dent2;
+/*     GList *p1 = wt_dents, *p2 = index_dents; */
+/*     WTDirent *dent1; */
+/*     IndexDirent *dent2; */
 
-    while (p1 && p2) {
-        dent1 = p1->data;
-        dent2 = p2->data;
+/*     while (p1 && p2) { */
+/*         dent1 = p1->data; */
+/*         dent2 = p2->data; */
 
-        int rc = strcmp (dent1->dname, dent2->dname);
-        if (rc == 0) {
-            if (S_ISREG(dent1->st.st_mode) && !dent2->is_dir) {
-                if (dent1->st.st_mtime != dent2->ce->ce_mtime.sec)
-                    *mod = g_list_prepend (*mod, concat_sub_path(dir_path, dent1->dname));
-            } else if ((S_ISREG(dent1->st.st_mode) && dent2->is_dir) ||
-                       (S_ISDIR(dent1->st.st_mode) && !dent2->is_dir)) {
-                *add = g_list_prepend (*add, concat_sub_path(dir_path, dent1->dname));
-                *del = g_list_prepend (*del, concat_sub_path(dir_path, dent1->dname));
-            }
-            p1 = p1->next;
-            p2 = p2->next;
-        } else if (rc < 0) {
-            *add = g_list_prepend (*add, concat_sub_path(dir_path, dent1->dname));
-            p1 = p1->next;
-        } else {
-            *del = g_list_prepend (*del, concat_sub_path(dir_path, dent2->dname));
-            p2 = p2->next;
-        }
-    }
+/*         int rc = strcmp (dent1->dname, dent2->dname); */
+/*         if (rc == 0) { */
+/*             if (S_ISREG(dent1->st.st_mode) && !dent2->is_dir) { */
+/*                 if (dent1->st.st_mtime != dent2->ce->ce_mtime.sec) */
+/*                     *mod = g_list_prepend (*mod, concat_sub_path(dir_path, dent1->dname)); */
+/*             } else if ((S_ISREG(dent1->st.st_mode) && dent2->is_dir) || */
+/*                        (S_ISDIR(dent1->st.st_mode) && !dent2->is_dir)) { */
+/*                 *add = g_list_prepend (*add, concat_sub_path(dir_path, dent1->dname)); */
+/*                 *del = g_list_prepend (*del, concat_sub_path(dir_path, dent1->dname)); */
+/*             } */
+/*             p1 = p1->next; */
+/*             p2 = p2->next; */
+/*         } else if (rc < 0) { */
+/*             *add = g_list_prepend (*add, concat_sub_path(dir_path, dent1->dname)); */
+/*             p1 = p1->next; */
+/*         } else { */
+/*             *del = g_list_prepend (*del, concat_sub_path(dir_path, dent2->dname)); */
+/*             p2 = p2->next; */
+/*         } */
+/*     } */
 
-    while (p1) {
-        dent1 = p1->data;
-        *add = g_list_prepend (*add, concat_sub_path(dir_path, dent1->dname));
-        p1 = p1->next;
-    }
+/*     while (p1) { */
+/*         dent1 = p1->data; */
+/*         *add = g_list_prepend (*add, concat_sub_path(dir_path, dent1->dname)); */
+/*         p1 = p1->next; */
+/*     } */
 
-    while (p2) {
-        dent2 = p2->data;
-        *del = g_list_prepend (*del, concat_sub_path(dir_path, dent2->dname));
-        p2 = p2->next;
-    }
+/*     while (p2) { */
+/*         dent2 = p2->data; */
+/*         *del = g_list_prepend (*del, concat_sub_path(dir_path, dent2->dname)); */
+/*         p2 = p2->next; */
+/*     } */
 
-    g_free (full_dir_path);
-    g_list_free_full (wt_dents, (GDestroyNotify)wt_dirent_free);
-    g_list_free_full (index_dents, (GDestroyNotify)index_dirent_free);
-    return 0;
-}
+/*     g_free (full_dir_path); */
+/*     g_list_free_full (wt_dents, (GDestroyNotify)wt_dirent_free); */
+/*     g_list_free_full (index_dents, (GDestroyNotify)index_dirent_free); */
+/*     return 0; */
+/* } */
 
 #endif  /* __APPLE__ */
 
@@ -2698,6 +2821,9 @@ update_active_path_cb (wchar_t *full_parent_w,
     SeafStat st;
 
     dname = g_utf16_to_utf8 (fdata->cFileName, -1, NULL, NULL, NULL);
+    if (!dname)
+        return 0;
+
     path = g_build_path ("/", upd_data->parent, dname, NULL);
 
     if (upd_data->ignored || should_ignore (upd_data->full_parent, dname, upd_data->ignore_list))
@@ -2911,37 +3037,37 @@ process_active_path (SeafRepo *repo, const char *path,
 
 #ifdef __APPLE__
 
-static void
-process_active_folder (SeafRepo *repo, const char *dir,
-                       struct index_state *istate, GList *ignore_list)
-{
-    GList *add = NULL, *mod = NULL, *del = NULL;
-    GList *p;
-    char *path;
+/* static void */
+/* process_active_folder (SeafRepo *repo, const char *dir, */
+/*                        struct index_state *istate, GList *ignore_list) */
+/* { */
+/*     GList *add = NULL, *mod = NULL, *del = NULL; */
+/*     GList *p; */
+/*     char *path; */
 
-    /* Delete event will be triggered on the deleted dir too. */
-    if (!g_file_test (dir, G_FILE_TEST_IS_DIR))
-        return;
+/*     /\* Delete event will be triggered on the deleted dir too. *\/ */
+/*     if (!g_file_test (dir, G_FILE_TEST_IS_DIR)) */
+/*         return; */
 
-    if (get_changed_paths_in_folder (repo, istate, dir, &add, &mod, &del) < 0) {
-        seaf_warning ("Failed to get changed paths under %s.\n", dir);
-        return;
-    }
+/*     if (get_changed_paths_in_folder (repo, istate, dir, &add, &mod, &del) < 0) { */
+/*         seaf_warning ("Failed to get changed paths under %s.\n", dir); */
+/*         return; */
+/*     } */
 
-    for (p = add; p; p = p->next) {
-        path = p->data;
-        process_active_path (repo, path, istate, ignore_list);
-    }
+/*     for (p = add; p; p = p->next) { */
+/*         path = p->data; */
+/*         process_active_path (repo, path, istate, ignore_list); */
+/*     } */
 
-    for (p = mod; p; p = p->next) {
-        path = p->data;
-        process_active_path (repo, path, istate, ignore_list);
-    }
+/*     for (p = mod; p; p = p->next) { */
+/*         path = p->data; */
+/*         process_active_path (repo, path, istate, ignore_list); */
+/*     } */
 
-    g_list_free_full (add, g_free);
-    g_list_free_full (mod, g_free);
-    g_list_free_full (del, g_free);
-}
+/*     g_list_free_full (add, g_free); */
+/*     g_list_free_full (mod, g_free); */
+/*     g_list_free_full (del, g_free); */
+/* } */
 
 #endif  /* __APPLE__ */
 
@@ -2959,11 +3085,11 @@ update_path_sync_status (SeafRepo *repo, WTStatus *status,
         if (!path)
             break;
 
-#ifdef __APPLE__
-        process_active_folder (repo, path, istate, ignore_list);
-#else
+/* #ifdef __APPLE__ */
+/*         process_active_folder (repo, path, istate, ignore_list); */
+/* #else */
         process_active_path (repo, path, istate, ignore_list);
-#endif
+/* #endif */
 
         g_free (path);
     }
@@ -3004,7 +3130,8 @@ static void
 handle_rename (SeafRepo *repo, struct index_state *istate,
                SeafileCrypt *crypt, GList *ignore_list,
                LockedFileSet *fset,
-               WTEvent *event, GList **scanned_del_dirs)
+               WTEvent *event, GList **scanned_del_dirs,
+               gint64 *total_size)
 {
     gboolean not_found, src_ignored, dst_ignored;
 
@@ -3022,16 +3149,16 @@ handle_rename (SeafRepo *repo, struct index_state *istate,
     if (seaf_filelock_manager_is_file_locked (seaf->filelock_mgr,
                                               repo->id, event->path)) {
         seaf_debug ("Rename: %s is locked on server, ignore.\n", event->path);
-        send_sync_error_notification (repo->id, NULL, event->path,
-                                      SYNC_ERROR_ID_FILE_LOCKED);
+        /* send_sync_error_notification (repo->id, NULL, event->path, */
+        /*                               SYNC_ERROR_ID_FILE_LOCKED); */
         return;
     }
 
     if (seaf_filelock_manager_is_file_locked (seaf->filelock_mgr,
                                               repo->id, event->new_path)) {
         seaf_debug ("Rename: %s is locked on server, ignore.\n", event->new_path);
-        send_sync_error_notification (repo->id, NULL, event->new_path,
-                                      SYNC_ERROR_ID_FILE_LOCKED);
+        /* send_sync_error_notification (repo->id, NULL, event->new_path, */
+        /*                               SYNC_ERROR_ID_FILE_LOCKED); */
         return;
     }
 
@@ -3058,8 +3185,7 @@ handle_rename (SeafRepo *repo, struct index_state *istate,
                                    DIFF_STATUS_DELETED,
                                    event->path,
                                    FALSE,
-                                   NULL,
-                                   FALSE);
+                                   NULL);
         }
         return;
     }
@@ -3113,7 +3239,7 @@ handle_rename (SeafRepo *repo, struct index_state *istate,
     add_recursive (repo->id, repo->version, repo->email,
                    istate, repo->worktree, event->new_path,
                    crypt, FALSE, ignore_list,
-                   NULL, NULL, &options);
+                   total_size, NULL, &options);
 }
 
 #ifdef WIN32
@@ -3181,6 +3307,64 @@ out:
     g_free (fullpath_w);
     return ret;
 }
+
+#endif
+
+#ifdef __APPLE__
+
+static gboolean
+find_office_file_path (const char *worktree,
+                       const char *parent_dir,
+                       const char *lock_file_name,
+                       char **office_path)
+{
+    GDir *dir = NULL;
+    GError *error = NULL;
+    char *fullpath = NULL;
+    const char *dname;
+    char *dname_nfc = NULL;
+    char *dname_skip_head = NULL;
+    gboolean ret = FALSE;
+
+    fullpath = g_build_path ("/", worktree, parent_dir, NULL);
+    dir = g_dir_open (fullpath, 0, &error);
+    if (error) {
+        seaf_warning ("Failed to open dir %s: %s.\n", fullpath, error->message);
+        g_clear_error (&error);
+        g_free (fullpath);
+        return ret;
+    }
+
+    while ((dname = g_dir_read_name (dir)) != NULL) {
+        dname_nfc = g_utf8_normalize (dname, -1, G_NORMALIZE_NFC);
+        if (!dname_nfc)
+            continue;
+
+        if (g_utf8_strlen(dname_nfc, -1) < 2 || strncmp (dname_nfc, "~$", 2) == 0) {
+            g_free (dname_nfc);
+            continue;
+        }
+
+        dname_skip_head = g_utf8_find_next_char(g_utf8_find_next_char(dname_nfc, NULL), NULL);
+
+        if (g_strcmp0 (dname_skip_head, lock_file_name) == 0) {
+            *office_path = g_build_path ("/", parent_dir, dname_nfc, NULL);
+            ret = TRUE;
+            g_free (dname_nfc);
+            break;
+        }
+
+        g_free (dname_nfc);
+    }
+
+    g_free (fullpath);
+    g_dir_close (dir);
+    return ret;
+}
+
+#endif
+
+#if defined WIN32 || defined __APPLE__
 
 static gboolean
 is_office_lock_file (const char *worktree,
@@ -3260,6 +3444,8 @@ do_lock_office_file (LockOfficeJob *job)
     }
     g_free (fullpath);
 
+    seaf_message ("Auto lock file %s/%s\n", repo->name, job->path);
+
     int status = seaf_filelock_manager_get_lock_status (seaf->filelock_mgr,
                                                         repo->id, job->path);
     if (status != FILE_NOT_LOCKED) {
@@ -3298,6 +3484,8 @@ do_unlock_office_file (LockOfficeJob *job)
         return;
     }
     g_free (fullpath);
+
+    seaf_message ("Auto unlock file %s/%s\n", repo->name, job->path);
 
     int status = seaf_filelock_manager_get_lock_status (seaf->filelock_mgr,
                                                         repo->id, job->path);
@@ -3414,7 +3602,7 @@ unlock_office_file_on_server (SeafRepo *repo, const char *path)
     g_async_queue_push (queue, job);
 }
 
-#endif  /* WIN32 */
+#endif
 
 static int
 apply_worktree_changes_to_index (SeafRepo *repo, struct index_state *istate,
@@ -3424,7 +3612,7 @@ apply_worktree_changes_to_index (SeafRepo *repo, struct index_state *istate,
     WTStatus *status;
     WTEvent *event, *next_event;
     gboolean not_found;
-#ifdef WIN32
+#if defined WIN32 || defined __APPLE__
     char *office_path = NULL;
 #endif
 
@@ -3490,11 +3678,13 @@ apply_worktree_changes_to_index (SeafRepo *repo, struct index_state *istate,
              */
             if (!is_path_writable(repo->id,
                                   repo->is_readonly, event->path)) {
+                send_file_sync_error_notification (repo->id, repo->name, event->path,
+                                                   SYNC_ERROR_ID_UPDATE_TO_READ_ONLY_REPO);
                 seaf_debug ("%s is not writable, ignore.\n", event->path);
                 break;
             }
 
-#ifdef WIN32
+#if defined WIN32 || defined __APPLE__
             office_path = NULL;
             if (is_office_lock_file (repo->worktree, event->path, &office_path))
                 lock_office_file_on_server (repo, office_path);
@@ -3521,7 +3711,7 @@ apply_worktree_changes_to_index (SeafRepo *repo, struct index_state *istate,
                                                   repo->id,
                                                   event->path);
 
-#ifdef WIN32
+#if defined WIN32 || defined __APPLE__
             office_path = NULL;
             if (is_office_lock_file (repo->worktree, event->path, &office_path))
                 unlock_office_file_on_server (repo, office_path);
@@ -3540,8 +3730,8 @@ apply_worktree_changes_to_index (SeafRepo *repo, struct index_state *istate,
             if (seaf_filelock_manager_is_file_locked (seaf->filelock_mgr,
                                                       repo->id, event->path)) {
                 seaf_debug ("Delete: %s is locked on server, ignore.\n", event->path);
-                send_sync_error_notification (repo->id, NULL, event->path,
-                                              SYNC_ERROR_ID_FILE_LOCKED);
+                /* send_sync_error_notification (repo->id, NULL, event->path, */
+                /*                               SYNC_ERROR_ID_FILE_LOCKED); */
                 break;
             }
 
@@ -3561,8 +3751,7 @@ apply_worktree_changes_to_index (SeafRepo *repo, struct index_state *istate,
                                        DIFF_STATUS_DELETED,
                                        event->path,
                                        FALSE,
-                                       NULL,
-                                       TRUE);
+                                       NULL);
 
                 try_add_empty_parent_dir_entry_from_wt (repo->worktree,
                                                         istate,
@@ -3571,7 +3760,7 @@ apply_worktree_changes_to_index (SeafRepo *repo, struct index_state *istate,
             }
             break;
         case WT_EVENT_RENAME:
-            handle_rename (repo, istate, crypt, ignore_list, fset, event, &scanned_del_dirs);
+            handle_rename (repo, istate, crypt, ignore_list, fset, event, &scanned_del_dirs, &total_size);
             break;
         case WT_EVENT_ATTRIB:
             if (!is_path_writable(repo->id,
@@ -3604,78 +3793,8 @@ out:
     return 0;
 }
 
-static void
-handle_unmerged_index_entries (SeafRepo *repo, struct index_state *istate,
-                               SeafileCrypt *crypt, GList *ignore_list)
-{
-    struct cache_entry **ce_array = istate->cache;
-    struct cache_entry *ce;
-    char path[SEAF_PATH_MAX];
-    unsigned int i;
-    SeafStat st;
-    int ret;
-    GList *unmerged_paths = NULL;
-    char *last_name = "";
-
-retry:
-    for (i = 0; i < istate->cache_nr; ++i) {
-        ce = ce_array[i];
-
-        if (ce_stage(ce) == 0)
-            continue;
-
-        snprintf (path, SEAF_PATH_MAX, "%s/%s", repo->worktree, ce->name);
-        ret = seaf_stat (path, &st);
-
-        if (S_ISDIR (ce->ce_mode)) {
-            if (ret < 0 || !S_ISDIR (st.st_mode)
-                || !is_empty_dir (path, ignore_list))
-                ce->ce_flags |= CE_REMOVE;
-            else if (strcmp (ce->name, last_name) != 0) {
-                unmerged_paths = g_list_append (unmerged_paths, g_strdup(ce->name));
-                last_name = ce->name;
-            }
-        } else {
-            if (ret < 0 || !S_ISREG (st.st_mode))
-                ce->ce_flags |= CE_REMOVE;
-            else if (strcmp (ce->name, last_name) != 0) {
-                unmerged_paths = g_list_append (unmerged_paths, g_strdup(ce->name));
-                last_name = ce->name;
-            }
-        }
-    }
-
-    remove_marked_cache_entries (istate);
-
-    GList *ptr;
-    char *ce_name;
-    for (ptr = unmerged_paths; ptr; ptr = ptr->next) {
-        ce_name = ptr->data;
-        snprintf (path, SEAF_PATH_MAX, "%s/%s", repo->worktree, ce_name);
-        ret = seaf_stat (path, &st);
-        if (ret < 0) {
-            seaf_warning ("Failed to stat %s: %s.\n", path, strerror(errno));
-            string_list_free (unmerged_paths);
-            unmerged_paths = NULL;
-            goto retry;
-        }
-
-        if (S_ISDIR (st.st_mode)) {
-            if (is_empty_dir (path, ignore_list))
-                add_empty_dir_to_index (istate, ce_name, &st);
-        } else {
-            gboolean added;
-            add_to_index (repo->id, repo->version, istate, ce_name, path,
-                          &st, 0, crypt, index_cb, repo->email, &added);
-        }
-    }
-
-    string_list_free (unmerged_paths);
-}
-
 static int
-index_add (SeafRepo *repo, struct index_state *istate,
-           gboolean is_force_commit, gboolean handle_unmerged)
+index_add (SeafRepo *repo, struct index_state *istate, gboolean is_force_commit)
 {
     SeafileCrypt *crypt = NULL;
     LockedFileSet *fset = NULL;
@@ -3686,7 +3805,7 @@ index_add (SeafRepo *repo, struct index_state *istate,
         crypt = seafile_crypt_new (repo->enc_version, repo->enc_key, repo->enc_iv);
     }
 
-#ifdef WIN32
+#if defined WIN32 || defined __APPLE__
     if (repo->version > 0)
         fset = seaf_repo_manager_get_locked_file_set (seaf->repo_mgr, repo->id);
 #endif
@@ -3703,16 +3822,9 @@ index_add (SeafRepo *repo, struct index_state *istate,
         ret = -1;
     }
 
-    /* If the index contains unmerged entries, check and remove those entries
-     * in the end, in cases where they were not completely handled in
-     * apply_worktree_changes_to_index().
-     */
-    if (handle_unmerged)
-        handle_unmerged_index_entries (repo, istate, crypt, ignore_list);
-
     seaf_repo_free_ignore_files (ignore_list);
 
-#ifdef WIN32
+#if defined WIN32 || defined __APPLE__
     locked_file_set_free (fset);
 #endif
 
@@ -3721,218 +3833,16 @@ index_add (SeafRepo *repo, struct index_state *istate,
     return ret;
 }
 
-/*
- * Add the files in @worktree to index and return the corresponding
- * @root_id. The repo doesn't have to exist.
- */
-int
-seaf_repo_index_worktree_files (const char *repo_id,
-                                int repo_version,
-                                const char *modifier,
-                                const char *worktree,
-                                const char *passwd,
-                                int enc_version,
-                                const char *random_key,
-                                char *root_id)
-{
-    char index_path[SEAF_PATH_MAX];
-    struct index_state istate;
-    unsigned char key[32], iv[16];
-    SeafileCrypt *crypt = NULL;
-    struct cache_tree *it = NULL;
-    GList *ignore_list = NULL;
-
-    memset (&istate, 0, sizeof(istate));
-    snprintf (index_path, SEAF_PATH_MAX, "%s/%s", seaf->repo_mgr->index_dir, repo_id);
-
-    /* Remove existing index. An existing index signifies an interrupted
-     * clone-merge. Removing it assures that new blocks from the worktree
-     * get added into the repo again (they're deleted by GC).
-     */
-    seaf_util_unlink (index_path);
-
-    if (read_index_from (&istate, index_path, repo_version) < 0) {
-        seaf_warning ("Failed to load index.\n");
-        return -1;
-    }
-
-    if (passwd != NULL) {
-        if (seafile_decrypt_repo_enc_key (enc_version, passwd,
-                                          random_key, key, iv) < 0) {
-            seaf_warning ("Failed to generate enc key for repo %s.\n", repo_id);
-            goto error;
-        }
-        crypt = seafile_crypt_new (enc_version, key, iv);
-    }
-
-    ignore_list = seaf_repo_load_ignore_files(worktree);
-
-    /* Add empty dir to index. Otherwise if the repo on relay contains an empty
-     * dir, we'll fail to detect fast-forward relationship later.
-     */
-    if (add_recursive (repo_id, repo_version, modifier,
-                       &istate, worktree, "", crypt, FALSE, ignore_list,
-                       NULL, NULL, NULL) < 0)
-        goto error;
-
-    remove_deleted (&istate, worktree, "", ignore_list, NULL, repo_id, FALSE, NULL);
-
-    it = cache_tree ();
-    if (cache_tree_update (repo_id, repo_version, worktree,
-                           it, istate.cache, istate.cache_nr,
-                           0, 0, commit_trees_cb) < 0) {
-        seaf_warning ("Failed to build cache tree");
-        goto error;
-    }
-
-    rawdata_to_hex (it->sha1, root_id, 20);
-
-    if (update_index (&istate, index_path) < 0)
-        goto error;
-
-    discard_index (&istate);
-    g_free (crypt);
-    if (it)
-        cache_tree_free (&it);
-    seaf_repo_free_ignore_files(ignore_list);
-    return 0;
-
-error:
-    discard_index (&istate);
-    g_free (crypt);
-    if (it)
-        cache_tree_free (&it);
-    seaf_repo_free_ignore_files(ignore_list);
-    return -1;
-}
-
-gboolean
-seaf_repo_is_worktree_changed (SeafRepo *repo)
-{
-    SeafRepoManager *mgr = repo->manager;
-    GList *res = NULL, *p;
-    struct index_state istate;
-    char index_path[SEAF_PATH_MAX];
-
-    DiffEntry *de;
-    int pos;
-    struct cache_entry *ce;
-    SeafStat sb;
-    char *full_path;
-
-    if (!check_worktree_common (repo))
-        return FALSE;
-
-    memset (&istate, 0, sizeof(istate));
-    snprintf (index_path, SEAF_PATH_MAX, "%s/%s", mgr->index_dir, repo->id);
-    if (read_index_from (&istate, index_path, repo->version) < 0) {
-        repo->index_corrupted = TRUE;
-        seaf_warning ("Failed to load index.\n");
-        goto error;
-    }
-    repo->index_corrupted = FALSE;
-
-    wt_status_collect_changes_worktree (&istate, &res, repo->worktree);
-    if (res != NULL)
-        goto changed;
-
-    wt_status_collect_untracked (&istate, &res, repo->worktree, should_ignore);
-    if (res != NULL)
-        goto changed;
-
-    wt_status_collect_changes_index (&istate, &res, repo);
-    if (res != NULL)
-        goto changed;
-
-    discard_index (&istate);
-
-    repo->wt_changed = FALSE;
-
-    /* g_debug ("%s worktree is changed\n", repo->id); */
-    return FALSE;
-
-changed:
-
-    g_message ("Worktree changes (at most 5 files are shown):\n");
-    int i = 0;
-    for (p = res; p != NULL && i < 5; p = p->next, ++i) {
-        de = p->data;
-
-        full_path = g_build_path ("/", repo->worktree, de->name, NULL);
-        if (seaf_stat (full_path, &sb) < 0) {
-            seaf_warning ("Failed to stat %s: %s.\n", full_path, strerror(errno));
-            g_free (full_path);
-            continue;
-        }
-        g_free (full_path);
-
-        pos = index_name_pos (&istate, de->name, strlen(de->name));
-        if (pos < 0) {
-            seaf_warning ("Cannot find diff entry %s in index.\n", de->name);
-            continue;
-        }
-        ce = istate.cache[pos];
-
-        g_message ("type: %c, status: %c, name: %s, "
-                   "ce mtime: %"G_GINT64_FORMAT", ce size: %" G_GUINT64_FORMAT ", "
-                   "file mtime: %d, file size: %" G_GUINT64_FORMAT "\n",
-                   de->type, de->status, de->name,
-                   ce->ce_mtime.sec, ce->ce_size, (int)sb.st_mtime, sb.st_size);
-    }
-
-    for (p = res; p; p = p->next) {
-        de = p->data;
-        diff_entry_free (de);
-    }
-    g_list_free (res);
-
-    discard_index (&istate);
-
-    repo->wt_changed = TRUE;
-
-    /* g_debug ("%s worktree is changed\n", repo->id); */
-    return TRUE;
-
-error:
-    return FALSE;
-}
-
-gboolean
-seaf_repo_is_index_unmerged (SeafRepo *repo)
-{
-    SeafRepoManager *mgr = repo->manager;
-    struct index_state istate;
-    char index_path[SEAF_PATH_MAX];
-    gboolean ret = FALSE;
-
-    if (!repo->head)
-        return FALSE;
-
-    memset (&istate, 0, sizeof(istate));
-    snprintf (index_path, SEAF_PATH_MAX, "%s/%s", mgr->index_dir, repo->id);
-    if (read_index_from (&istate, index_path, repo->version) < 0) {
-        seaf_warning ("Failed to load index.\n");
-        return FALSE;
-    }
-
-    if (unmerged_index (&istate))
-        ret = TRUE;
-
-    discard_index (&istate);
-    return ret;
-}
-
 static int
 commit_tree (SeafRepo *repo, const char *root_id,
-             const char *desc, char commit_id[],
-             gboolean unmerged)
+             const char *desc, char commit_id[])
 {
     SeafCommit *commit;
 
     commit = seaf_commit_new (NULL, repo->id, root_id,
                               repo->email ? repo->email
-                              : seaf->session->base.user_name,
-                              seaf->session->base.id,
+                              : "unknown",
+                              seaf->client_id,
                               desc, 0);
 
     commit->parent_id = g_strdup (repo->head->commit_id);
@@ -3940,23 +3850,6 @@ commit_tree (SeafRepo *repo, const char *root_id,
     /* Add this computer's name to commit. */
     commit->device_name = g_strdup(seaf->client_name);
     commit->client_version = g_strdup (SEAFILE_CLIENT_VERSION);
-
-    if (unmerged) {
-        SeafRepoMergeInfo minfo;
-
-        /* Don't use head commit of master branch since that branch may have
-         * been updated after the last merge.
-         */
-        memset (&minfo, 0, sizeof(minfo));
-        if (seaf_repo_manager_get_merge_info (repo->manager, repo->id, &minfo) < 0) {
-            seaf_warning ("Failed to get merge info of repo %.10s.\n", repo->id);
-            return -1;
-        }
-
-        commit->second_parent_id = g_strdup (minfo.remote_head);
-        commit->new_merge = TRUE;
-        commit->conflict = TRUE;
-    }
 
     seaf_repo_to_commit (repo, commit);
 
@@ -3970,23 +3863,6 @@ commit_tree (SeafRepo *repo, const char *root_id,
     seaf_commit_unref (commit);
 
     return 0;
-}
-
-static gboolean
-need_handle_unmerged_index (SeafRepo *repo, struct index_state *istate)
-{
-    if (!unmerged_index (istate))
-        return FALSE;
-
-    /* Syncing with an existing directory may require a real merge.
-     * If the merge produced conflicts, the index will be unmerged.
-     * But we don't want to generate a merge commit in this case.
-     * An "index" branch should exist in this case.
-     */
-    if (seaf_branch_manager_branch_exists (seaf->branch_mgr, repo->id, "index"))
-        return FALSE;
-
-    return TRUE;
 }
 
 static gboolean
@@ -4033,15 +3909,8 @@ print_index (struct index_state *istate)
 }
 #endif
 
-static inline void
-print_time (const char *desc, GTimeVal *s, GTimeVal *e)
-{
-    seaf_message ("%s: %lu\n", desc,
-                  (e->tv_sec*G_USEC_PER_SEC+e->tv_usec - (s->tv_sec*G_USEC_PER_SEC+s->tv_usec))/1000);
-}
-
 char *
-seaf_repo_index_commit (SeafRepo *repo, const char *desc,
+seaf_repo_index_commit (SeafRepo *repo,
                         gboolean is_force_commit,
                         gboolean is_initial_commit,
                         GError **error)
@@ -4052,9 +3921,9 @@ seaf_repo_index_commit (SeafRepo *repo, const char *desc,
     SeafCommit *head = NULL;
     char *new_root_id = NULL;
     char commit_id[41];
-    gboolean unmerged = FALSE;
     ChangeSet *changeset = NULL;
-    char *my_desc = NULL;
+    GList *diff_results = NULL;
+    char *desc = NULL;
     char *ret = NULL;
 
     if (!check_worktree_common (repo))
@@ -4068,9 +3937,6 @@ seaf_repo_index_commit (SeafRepo *repo, const char *desc,
         return NULL;
     }
 
-    if (need_handle_unmerged_index (repo, &istate))
-        unmerged = TRUE;
-
     changeset = changeset_new (repo->id);
     if (!changeset) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_INTERNAL, "Internal data structure error");
@@ -4079,17 +3945,13 @@ seaf_repo_index_commit (SeafRepo *repo, const char *desc,
 
     repo->changeset = changeset;
 
-    if (index_add (repo, &istate, is_force_commit, unmerged) < 0) {
+    if (index_add (repo, &istate, is_force_commit) < 0) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL, "Failed to add");
         goto out;
     }
 
     if (!istate.cache_changed)
         goto out;
-
-    my_desc = diff_results_to_description (changeset->diff);
-    if (!my_desc)
-        my_desc = g_strdup("");
 
     if (!is_initial_commit && !is_force_commit) {
         new_root_id = commit_tree_from_changeset (changeset);
@@ -4139,7 +4001,12 @@ seaf_repo_index_commit (SeafRepo *repo, const char *desc,
         goto out;
     }
 
-    if (commit_tree (repo, new_root_id, my_desc, commit_id, unmerged) < 0) {
+    diff_commit_roots (repo->id, repo->version, head->root_id, new_root_id, &diff_results, TRUE);
+    desc = diff_results_to_description (diff_results);
+    if (!desc)
+        desc = g_strdup("");
+
+    if (commit_tree (repo, new_root_id, desc, commit_id) < 0) {
         seaf_warning ("Failed to save commit file");
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_INTERNAL, "Internal error");
         goto out;
@@ -4155,10 +4022,11 @@ seaf_repo_index_commit (SeafRepo *repo, const char *desc,
     ret = g_strdup(commit_id);
 
 out:
-    g_free (my_desc);
+    g_free (desc);
     seaf_commit_unref (head);
     g_free (new_root_id);
     changeset_free (changeset);
+    g_list_free_full (diff_results, (GDestroyNotify)diff_entry_free);
     discard_index (&istate);
     return ret;
 }
@@ -4201,240 +4069,6 @@ print_index (struct index_state *istate)
     return 0;
 }
 #endif  /* DEBUG_UNPACK_TREES */
-
-int
-seaf_repo_checkout_commit (SeafRepo *repo, SeafCommit *commit, gboolean recover_merge,
-                           char **error)
-{
-    SeafRepoManager *mgr = repo->manager;
-    char index_path[SEAF_PATH_MAX];
-    struct tree_desc trees[2];
-    struct unpack_trees_options topts;
-    struct index_state istate;
-    gboolean initial_checkout;
-    GString *err_msgs;
-    int ret = 0;
-
-    memset (&istate, 0, sizeof(istate));
-    snprintf (index_path, SEAF_PATH_MAX, "%s/%s", mgr->index_dir, repo->id);
-    if (read_index_from (&istate, index_path, repo->version) < 0) {
-        seaf_warning ("Failed to load index.\n");
-        return -1;
-    }
-    repo->index_corrupted = FALSE;
-    initial_checkout = is_index_unborn(&istate);
-
-    if (!initial_checkout) {
-        if (!repo->head) {
-            /* TODO: Set error string*/
-            seaf_warning ("Repo corrupt: Index exists but head branch is not set\n");
-            return -1;
-        }
-        SeafCommit *head =
-            seaf_commit_manager_get_commit (seaf->commit_mgr,
-                                            repo->id, repo->version,
-                                            repo->head->commit_id);
-        if (!head) {
-            seaf_warning ("Failed to get commit %s:%s.\n",
-                          repo->id, repo->head->commit_id);
-            discard_index (&istate);
-            return -1;
-        }
-        fill_tree_descriptor (repo->id, repo->version, &trees[0], head->root_id);
-        seaf_commit_unref (head);
-    } else {
-        fill_tree_descriptor (repo->id, repo->version, &trees[0], NULL);
-    }
-    fill_tree_descriptor (repo->id, repo->version, &trees[1], commit->root_id);
-
-    /* 2-way merge to the new branch */
-    memset(&topts, 0, sizeof(topts));
-    memcpy (topts.repo_id, repo->id, 36);
-    topts.version = repo->version;
-    topts.base = repo->worktree;
-    topts.head_idx = -1;
-    topts.src_index = &istate;
-    /* topts.dst_index = &istate; */
-    topts.initial_checkout = initial_checkout;
-    topts.update = 1;
-    topts.merge = 1;
-    topts.gently = 0;
-    topts.verbose_update = 0;
-    /* topts.debug_unpack = 1; */
-    topts.fn = twoway_merge;
-    if (repo->encrypted) {
-        topts.crypt = seafile_crypt_new (repo->enc_version, 
-                                         repo->enc_key, 
-                                         repo->enc_iv);
-    }
-
-    if (unpack_trees (2, trees, &topts) < 0) {
-        seaf_warning ("Failed to merge commit %s with work tree.\n", commit->commit_id);
-        ret = -1;
-        goto out;
-    }
-
-#ifdef WIN32
-    if (!initial_checkout && !recover_merge &&
-        files_locked_on_windows(&topts.result, repo->worktree)) {
-        g_debug ("[checkout] files are locked, quit checkout now.\n");
-        ret = -1;
-        goto out;
-    }
-#endif
-
-    int *finished_entries = NULL;
-    CheckoutTask *c_task = seaf_repo_manager_get_checkout_task (repo->manager, repo->id);
-    if (c_task) {
-        finished_entries = &c_task->finished_files;
-    }
-    if (update_worktree (&topts, recover_merge,
-                         initial_checkout ? NULL : commit->commit_id,
-                         commit->creator_name,
-                         finished_entries) < 0) {
-        seaf_warning ("Failed to update worktree.\n");
-        /* Still finish checkout even have I/O errors. */
-    }
-
-    discard_index (&istate);
-    istate = topts.result;
-    if (update_index (&istate, index_path) < 0) {
-        seaf_warning ("Failed to update index.\n");
-        ret = -1;
-        goto out;
-    }
-
-out:
-    err_msgs = g_string_new ("");
-    get_unpack_trees_error_msgs (&topts, err_msgs, OPR_CHECKOUT);
-    *error = g_string_free (err_msgs, FALSE);
-
-    tree_desc_free (&trees[0]);
-    tree_desc_free (&trees[1]);
-
-    g_free (topts.crypt);
-
-    discard_index (&istate);
-
-    return ret;
-}
-
-
-/**
- * Checkout the content of "local" branch to <worktree_parent>/repo-name.
- * The worktree will be set to this place too.
- */
-int
-seaf_repo_checkout (SeafRepo *repo, const char *worktree, char **error)
-{
-    const char *commit_id;
-    SeafBranch *branch;
-    SeafCommit *commit;
-    GString *err_msgs;
-
-    /* remove original index */
-    char index_path[SEAF_PATH_MAX];
-    snprintf (index_path, SEAF_PATH_MAX, "%s/%s", repo->manager->index_dir, repo->id);
-    seaf_util_unlink (index_path);
-
-    branch = seaf_branch_manager_get_branch (seaf->branch_mgr,
-                                             repo->id, "local");
-    if (!branch) {
-        seaf_warning ("[repo-mgr] Checkout repo failed: local branch does not exists\n");
-        *error = g_strdup ("Repo's local branch does not exists.");
-        goto error;
-    }
-    commit_id = branch->commit_id;
-        
-    commit = seaf_commit_manager_get_commit (seaf->commit_mgr,
-                                             repo->id,
-                                             repo->version,
-                                             commit_id);
-    if (!commit) {
-        err_msgs = g_string_new ("");
-        g_string_append_printf (err_msgs, "Commit %s does not exist.\n",
-                                commit_id);
-        seaf_warning ("%s", err_msgs->str);
-        *error = g_string_free (err_msgs, FALSE);
-        seaf_branch_unref (branch);
-        goto error;
-    }
-
-    if (strcmp(repo->id, commit->repo_id) != 0) {
-        err_msgs = g_string_new ("");
-        g_string_append_printf (err_msgs, "Commit %s is not in Repo %s.\n", 
-                                commit_id, repo->id);
-        seaf_warning ("%s", err_msgs->str);
-        *error = g_string_free (err_msgs, FALSE);
-        seaf_commit_unref (commit);
-        if (branch)
-            seaf_branch_unref (branch);
-        goto error;
-    }
-
-    CheckoutTask *task = seaf_repo_manager_get_checkout_task (seaf->repo_mgr,
-                                                              repo->id);
-    if (!task) {
-        seaf_warning ("No checkout task found for repo %.10s.\n", repo->id);
-        goto error;
-    }
-    task->total_files = seaf_fs_manager_count_fs_files (seaf->fs_mgr,
-                                                        repo->id, repo->version,
-                                                        commit->root_id);
-
-    if (task->total_files < 0) {
-        seaf_warning ("Failed to count files for repo %.10s .\n", repo->id);
-        goto error;
-    }
-
-    if (seaf_repo_checkout_commit (repo, commit, FALSE, error) < 0) {
-        seaf_commit_unref (commit);
-        if (branch)
-            seaf_branch_unref (branch);
-        goto error;
-    }
-
-    seaf_branch_unref (branch);
-    seaf_commit_unref (commit);
-
-    return 0;
-
-error:
-    return -1;
-}
-
-int
-seaf_repo_merge (SeafRepo *repo, const char *branch, char **error,
-                 int *merge_status)
-{
-    SeafBranch *remote_branch;
-    int ret = 0;
-
-    if (!check_worktree_common (repo))
-        return -1;
-
-    remote_branch = seaf_branch_manager_get_branch (seaf->branch_mgr,
-                                                    repo->id,
-                                                    branch);
-    if (!remote_branch) {
-        *error = g_strdup("Invalid remote branch.\n");
-        goto error;
-    }
-
-    if (g_strcmp0 (remote_branch->repo_id, repo->id) != 0) {
-        *error = g_strdup ("Remote branch is not in this repository.\n");
-        seaf_branch_unref (remote_branch);
-        goto error;
-    }
-
-    ret = merge_branches (repo, remote_branch, error, merge_status);
-    seaf_branch_unref (remote_branch);
-
-    return ret;
-
-error:
-    return -1;
-}
 
 GList *
 seaf_repo_diff (SeafRepo *repo, const char *old, const char *new, int fold_dir_diff, char **error)
@@ -4493,190 +4127,6 @@ seaf_repo_diff (SeafRepo *repo, const char *old, const char *new, int fold_dir_d
     seaf_commit_unref (c2);
 
     return diff_entries;
-}
-
-int
-checkout_file (const char *repo_id,
-               int repo_version,
-               const char *worktree,
-               const char *name,
-               const char *file_id,
-               gint64 mtime,
-               unsigned int mode,
-               SeafileCrypt *crypt,
-               struct cache_entry *ce,
-               TransferTask *task,
-               HttpTxTask *http_task,
-               gboolean is_http,
-               const char *conflict_head_id,
-               GHashTable *conflict_hash,
-               GHashTable *no_conflict_hash,
-               gboolean download_only)
-{
-    char *path;
-    SeafStat st, st2;
-    unsigned char sha1[20];
-    gboolean path_exists = FALSE;
-    gboolean case_conflict = FALSE;
-    gboolean force_conflict = FALSE;
-    gboolean update_mode_only = FALSE;
-
-    path = build_checkout_path (worktree, name, strlen(name));
-
-    if (!path)
-        return FETCH_CHECKOUT_FAILED;
-
-    hex_to_rawdata (file_id, sha1, 20);
-
-    path_exists = (seaf_stat (path, &st) == 0);
-
-    if (path_exists && S_ISREG(st.st_mode)) {
-        if (st.st_mtime == ce->ce_mtime.sec) {
-            /* Worktree and index are consistent. */
-            if (memcmp (sha1, ce->sha1, 20) == 0) {
-                if (mode == ce->ce_mode) {
-                    /* Worktree and index are all uptodate, no need to checkout.
-                     * This may happen after an interrupted checkout.
-                     */
-                    seaf_debug ("wt and index are consistent. no need to checkout.\n");
-                    goto update_cache;
-                } else
-                    update_mode_only = TRUE;
-            }
-            /* otherwise we have to checkout the file. */
-        } else {
-            if (compare_file_content (path, &st, sha1, crypt, repo_version) == 0) {
-                /* This happens after the worktree file was updated,
-                 * but the index was not. Just need to update the index.
-                 */
-                seaf_debug ("update index only.\n");
-                goto update_cache;
-            } else {
-                /* Conflict. The worktree file was updated by the user. */
-                seaf_message ("File %s is updated by user. "
-                              "Will checkout to conflict file later.\n", path);
-                force_conflict = TRUE;
-            }
-        }
-    }
-
-    if (update_mode_only) {
-#ifdef WIN32
-        g_free (path);
-        return FETCH_CHECKOUT_SUCCESS;
-#else
-        chmod (path, mode & ~S_IFMT);
-        ce->ce_mode = mode;
-        g_free (path);
-        return FETCH_CHECKOUT_SUCCESS;
-#endif
-    }
-
-    /* Download the blocks of this file. */
-    int rc;
-    if (!is_http) {
-        rc = seaf_transfer_manager_download_file_blocks (seaf->transfer_mgr,
-                                                         task, file_id);
-        switch (rc) {
-        case BLOCK_CLIENT_SUCCESS:
-            break;
-        case BLOCK_CLIENT_UNKNOWN:
-        case BLOCK_CLIENT_FAILED:
-        case BLOCK_CLIENT_NET_ERROR:
-        case BLOCK_CLIENT_SERVER_ERROR:
-            g_free (path);
-            return FETCH_CHECKOUT_TRANSFER_ERROR;
-        case BLOCK_CLIENT_CANCELED:
-            g_free (path);
-            return FETCH_CHECKOUT_CANCELED;
-        }
-    } else {
-        rc = http_tx_task_download_file_blocks (http_task, file_id);
-        if (http_task->state == HTTP_TASK_STATE_CANCELED) {
-            g_free (path);
-            return FETCH_CHECKOUT_CANCELED;
-        }
-        if (rc < 0) {
-            g_free (path);
-            return FETCH_CHECKOUT_TRANSFER_ERROR;
-        }
-    }
-
-    if (download_only) {
-        g_free (path);
-        return FETCH_CHECKOUT_SUCCESS;
-    }
-
-    /* The worktree file may have been changed when we're downloading the blocks. */
-    if (path_exists && S_ISREG(st.st_mode) && !force_conflict) {
-        seaf_stat (path, &st2);
-        if (st.st_mtime != st2.st_mtime) {
-            seaf_message ("File %s is updated by user. "
-                          "Will checkout to conflict file later.\n", path);
-            force_conflict = TRUE;
-        }
-    }
-
-    /* Temporarily unlock the file if it's locked on server, so that the client
-     * itself can write to it. 
-     */
-    if (seaf_filelock_manager_is_file_locked (seaf->filelock_mgr,
-                                              repo_id, name))
-        seaf_filelock_manager_unlock_wt_file (seaf->filelock_mgr,
-                                              repo_id, name);
-
-    /* then checkout the file. */
-    gboolean conflicted = FALSE;
-    if (seaf_fs_manager_checkout_file (seaf->fs_mgr,
-                                       repo_id,
-                                       repo_version,
-                                       file_id,
-                                       path,
-                                       mode,
-                                       mtime,
-                                       crypt,
-                                       name,
-                                       conflict_head_id,
-                                       force_conflict,
-                                       &conflicted,
-                                       is_http ? http_task->email : task->email) < 0) {
-        seaf_warning ("Failed to checkout file %s.\n", path);
-        g_free (path);
-
-        if (seaf_filelock_manager_is_file_locked (seaf->filelock_mgr,
-                                                  repo_id, name))
-            seaf_filelock_manager_lock_wt_file (seaf->filelock_mgr,
-                                                repo_id, name);
-
-        return FETCH_CHECKOUT_FAILED;
-    }
-
-    if (seaf_filelock_manager_is_file_locked (seaf->filelock_mgr,
-                                              repo_id, name))
-        seaf_filelock_manager_lock_wt_file (seaf->filelock_mgr,
-                                            repo_id, name);
-
-    /* If case conflict, this file has been checked out to another path.
-     * Remove the current entry, otherwise it won't be removed later
-     * since it's timestamp is 0.
-     */
-    if (case_conflict) {
-        ce->ce_flags |= CE_REMOVE;
-        g_free (path);
-        return FETCH_CHECKOUT_SUCCESS;
-    }
-
-update_cache:
-    /* finally fill cache_entry info */
-    /* Only update index if we checked out the file without any error
-     * or conflicts. The timestamp of the entry will remain 0 if error
-     * or conflicted.
-     */
-    seaf_stat (path, &st);
-    fill_stat_cache_info (ce, &st);
-
-    g_free (path);
-    return FETCH_CHECKOUT_SUCCESS;
 }
 
 int
@@ -4744,186 +4194,7 @@ cache_entry_from_diff_entry (DiffEntry *de)
     return ce;
 }
 
-static void
-cleanup_file_blocks (const char *repo_id, int version, const char *file_id)
-{
-    Seafile *file;
-    int i;
-
-    file = seaf_fs_manager_get_seafile (seaf->fs_mgr,
-                                        repo_id, version,
-                                        file_id);
-    if (!file) {
-        seaf_warning ("Failed to load seafile object %s:%s\n", repo_id, file_id);
-        return;
-    }
-
-    for (i = 0; i < file->n_blocks; ++i)
-        seaf_block_manager_remove_block (seaf->block_mgr,
-                                         repo_id, version,
-                                         file->blk_sha1s[i]);
-
-    seafile_unref (file);
-}
-
 #define UPDATE_CACHE_SIZE_LIMIT 100 * (1 << 20) /* 100MB */
-
-static int
-download_files_no_http (const char *repo_id,
-                        int repo_version,
-                        const char *worktree,
-                        struct index_state *istate,
-                        const char *index_path,
-                        SeafileCrypt *crypt,
-                        TransferTask *task,
-                        GList *results,
-                        GHashTable *conflict_hash,
-                        GHashTable *no_conflict_hash,
-                        const char *remote_head_id,
-                        LockedFileSet *fset)
-{
-    GList *ptr;
-    struct cache_entry *ce;
-    DiffEntry *de;
-    gint64 checkout_size = 0;
-    int rc;
-    gboolean is_clone = task->is_clone;
-    int ret = FETCH_CHECKOUT_SUCCESS;
-
-    for (ptr = results; ptr; ptr = ptr->next) {
-        de = ptr->data;
-
-        if (de->status == DIFF_STATUS_ADDED ||
-            de->status == DIFF_STATUS_MODIFIED) {
-            seaf_debug ("Checkout file %s.\n", de->name);
-
-            gboolean add_ce = FALSE;
-            gboolean is_locked = FALSE;
-            char file_id[41];
-
-            rawdata_to_hex (de->sha1, file_id, 20);
-
-            ce = index_name_exists (istate, de->name, strlen(de->name), 0);
-            if (!ce) {
-                ce = cache_entry_from_diff_entry (de);
-                add_ce = TRUE;
-            }
-
-            if (!should_ignore_on_checkout (de->name)) {
-#ifdef WIN32
-                is_locked = do_check_file_locked (de->name, worktree, FALSE);
-#endif
-
-                if (!is_clone)
-                    seaf_sync_manager_update_active_path (seaf->sync_mgr,
-                                                          repo_id,
-                                                          de->name,
-                                                          de->mode,
-                                                          SYNC_STATUS_SYNCING);
-
-                rc = checkout_file (repo_id,
-                                    repo_version,
-                                    worktree,
-                                    de->name,
-                                    file_id,
-                                    de->mtime,
-                                    de->mode,
-                                    crypt,
-                                    ce,
-                                    task,
-                                    NULL,
-                                    FALSE,
-                                    remote_head_id,
-                                    conflict_hash,
-                                    no_conflict_hash,
-                                    is_locked);
-
-                /* Even if the file failed to check out, still need to update index.
-                 * But we have to stop after transfer errors.
-                 */
-                if (rc == FETCH_CHECKOUT_CANCELED) {
-                    seaf_debug ("Transfer canceled.\n");
-                    ret = FETCH_CHECKOUT_CANCELED;
-                    if (add_ce)
-                        cache_entry_free (ce);
-                    return ret;
-                } else if (rc == FETCH_CHECKOUT_TRANSFER_ERROR) {
-                    seaf_warning ("Transfer failed.\n");
-                    ret = FETCH_CHECKOUT_TRANSFER_ERROR;
-                    if (add_ce)
-                        cache_entry_free (ce);
-                    return ret;
-                }
-
-                if (!is_locked) {
-                    cleanup_file_blocks (repo_id, repo_version, file_id);
-                } else {
-#ifdef WIN32
-                    locked_file_set_add_update (fset, de->name, LOCKED_OP_UPDATE,
-                                                ce->ce_mtime.sec, file_id);
-                    /* Stay in syncing status if the file is locked. */
-#endif
-                }
-            }
-
-            ++(task->n_downloaded);
-
-            if (add_ce) {
-                if (!(ce->ce_flags & CE_REMOVE)) {
-                    add_index_entry (istate, ce,
-                                     (ADD_CACHE_OK_TO_ADD|ADD_CACHE_OK_TO_REPLACE));
-                }
-            } else {
-                ce->ce_mtime.sec = de->mtime;
-                ce->ce_size = de->size;
-                memcpy (ce->sha1, de->sha1, 20);
-                if (ce->modifier) g_free (ce->modifier);
-                ce->modifier = g_strdup(de->modifier);
-                ce->ce_mode = create_ce_mode (de->mode);
-            }
-
-            /* Save index file to disk after checking out some size of files.
-             * This way we don't need to re-compare too many files if this
-             * checkout is interrupted.
-             */
-            checkout_size += ce->ce_size;
-            if (checkout_size >= UPDATE_CACHE_SIZE_LIMIT) {
-                seaf_debug ("Save index file.\n");
-                update_index (istate, index_path);
-                checkout_size = 0;
-            }
-        } else if (de->status == DIFF_STATUS_DIR_ADDED) {
-            seaf_debug ("Checkout empty dir %s.\n", de->name);
-
-            gboolean add_ce = FALSE;
-
-            ce = index_name_exists (istate, de->name, strlen(de->name), 0);
-            if (!ce) {
-                ce = cache_entry_from_diff_entry (de);
-                add_ce = TRUE;
-            }
-
-            checkout_empty_dir (worktree,
-                                de->name,
-                                de->mtime,
-                                ce,
-                                conflict_hash,
-                                no_conflict_hash);
-
-            if (add_ce) {
-                if (!(ce->ce_flags & CE_REMOVE)) {
-                    add_index_entry (istate, ce,
-                                     (ADD_CACHE_OK_TO_ADD|ADD_CACHE_OK_TO_REPLACE));
-                }
-            } else
-                ce->ce_mtime.sec = de->mtime;
-        }
-    }
-
-    update_index (istate, index_path);
-
-    return FETCH_CHECKOUT_SUCCESS;
-}
 
 typedef struct FileTxData {
     char repo_id[37];
@@ -5086,7 +4357,7 @@ schedule_file_fetch (GThreadPool *tpool,
     struct cache_entry *ce;
     gboolean new_ce = FALSE;
     gboolean skip_fetch = FALSE;
-    char *path;
+    char *path = NULL;
     FileTxTask *file_task;
 
     ce = index_name_exists (istate, de->name, strlen(de->name), 0);
@@ -5095,11 +4366,16 @@ schedule_file_fetch (GThreadPool *tpool,
         new_ce = TRUE;
     }
 
-    if (should_ignore_on_checkout (de->name)) {
+    IgnoreReason reason;
+    if (should_ignore_on_checkout (de->name, &reason)) {
         seaf_message ("Path %s is invalid on Windows, skip checkout\n",
                       de->name);
-        send_sync_error_notification (repo_id, repo_name, de->name,
-                                      SYNC_ERROR_ID_INVALID_PATH);
+        if (reason == IGNORE_REASON_END_SPACE_PERIOD)
+            send_file_sync_error_notification (repo_id, repo_name, de->name,
+                                               SYNC_ERROR_ID_PATH_END_SPACE_PERIOD);
+        else if (reason == IGNORE_REASON_INVALID_CHARACTER)
+            send_file_sync_error_notification (repo_id, repo_name, de->name,
+                                               SYNC_ERROR_ID_PATH_INVALID_CHARACTER);
         skip_fetch = TRUE;
     }
 
@@ -5214,7 +4490,7 @@ checkout_file_http (FileTxData *data,
     if (no_checkout)
         return FETCH_CHECKOUT_SUCCESS;
 
-    if (should_ignore_on_checkout (de->name))
+    if (should_ignore_on_checkout (de->name, NULL))
         return FETCH_CHECKOUT_SUCCESS;
 
     rawdata_to_hex (de->sha1, file_id, 20);
@@ -5222,11 +4498,11 @@ checkout_file_http (FileTxData *data,
     locked_on_server = seaf_filelock_manager_is_file_locked (seaf->filelock_mgr,
                                                              repo_id, de->name);
 
-#ifdef WIN32
+#if defined WIN32 || defined __APPLE__
     if (do_check_file_locked (de->name, worktree, locked_on_server)) {
         if (!locked_file_set_lookup (fset, de->name))
-            send_sync_error_notification (repo_id, NULL, de->name,
-                                          SYNC_ERROR_ID_FILE_LOCKED_BY_APP);
+            send_file_sync_error_notification (repo_id, NULL, de->name,
+                                               SYNC_ERROR_ID_FILE_LOCKED_BY_APP);
 
         locked_file_set_add_update (fset, de->name, LOCKED_OP_UPDATE,
                                     ce->ce_mtime.sec, file_id);
@@ -5288,11 +4564,11 @@ checkout_file_http (FileTxData *data,
     cleanup_file_blocks_http (http_task, file_id);
 
     if (conflicted) {
-        http_tx_manager_notify_conflict (http_task, de->name);
+        send_file_sync_error_notification (repo_id, NULL, de->name, SYNC_ERROR_ID_CONFLICT);
     } else if (!http_task->is_clone) {
         char *orig_path = NULL;
         if (check_path_conflict (de->name, &orig_path))
-            http_tx_manager_notify_conflict (http_task, orig_path);
+            send_file_sync_error_notification (repo_id, NULL, orig_path, SYNC_ERROR_ID_CONFLICT);
         g_free (orig_path);
     }
 
@@ -5333,11 +4609,16 @@ handle_dir_added_de (const char *repo_id,
         add_ce = TRUE;
     }
 
-    if (should_ignore_on_checkout (de->name)) {
+    IgnoreReason reason;
+    if (should_ignore_on_checkout (de->name, &reason)) {
         seaf_message ("Path %s is invalid on Windows, skip checkout\n",
                       de->name);
-        send_sync_error_notification (repo_id, repo_name, de->name,
-                                      SYNC_ERROR_ID_INVALID_PATH);
+        if (reason == IGNORE_REASON_END_SPACE_PERIOD)
+            send_file_sync_error_notification (repo_id, repo_name, de->name,
+                                               SYNC_ERROR_ID_PATH_END_SPACE_PERIOD);
+        else if (reason == IGNORE_REASON_INVALID_CHARACTER)
+            send_file_sync_error_notification (repo_id, repo_name, de->name,
+                                               SYNC_ERROR_ID_PATH_INVALID_CHARACTER);
         goto update_index;
     }
 
@@ -5469,8 +4750,6 @@ download_files_http (const char *repo_id,
                                                   de->mode,
                                                   status);
         }
-
-        ++(http_task->done_files);
 
         if (task->new_ce) {
             if (!(ce->ce_flags & CE_REMOVE)) {
@@ -5636,6 +4915,15 @@ is_built_in_ignored_file (const char *filename)
         spec++;
     }
 
+    if (!seaf->sync_extra_temp_file) {
+        spec = office_temp_ignore_patterns;
+        while (*spec) {
+            if (g_pattern_match_string(*spec, filename))
+                return TRUE;
+            spec++;
+        }
+    }
+
     return FALSE;
 }
 
@@ -5651,7 +4939,6 @@ delete_worktree_dir_recursive_win32 (struct index_state *istate,
                                      const char *path,
                                      const wchar_t *path_w)
 {
-    struct cache_entry *ce;
     WIN32_FIND_DATAW fdata;
     HANDLE handle;
     wchar_t *pattern;
@@ -5683,12 +4970,15 @@ delete_worktree_dir_recursive_win32 (struct index_state *istate,
             wcscmp (fdata.cFileName, L"..") == 0)
             continue;
 
+        dname = g_utf16_to_utf8 (fdata.cFileName, -1, NULL, NULL, NULL);
+        if (!dname)
+            continue;
+
         sub_path_w = g_new0 (wchar_t, path_len_w + wcslen(fdata.cFileName) + 2);
         wcscpy (sub_path_w, path_w);
         wcscat (sub_path_w, L"\\");
         wcscat (sub_path_w, fdata.cFileName);
 
-        dname = g_utf16_to_utf8 (fdata.cFileName, -1, NULL, NULL, NULL);
         sub_path = g_strconcat (path, "/", dname, NULL);
         builtin_ignored = is_built_in_ignored_file(dname);
         g_free (dname);
@@ -5698,11 +4988,13 @@ delete_worktree_dir_recursive_win32 (struct index_state *istate,
                 ret = -1;
             }
         } else {
+            struct cache_entry *ce;
             /* Files like .DS_Store and Thumbs.db should be deleted any way. */
             if (!builtin_ignored) {
                 mtime = (guint64)file_time_to_unix_time (&fdata.ftLastWriteTime);
                 ce = index_name_exists (istate, sub_path, strlen(sub_path), 0);
-                if (!ce || ce->ce_mtime.sec != mtime) {
+                if (!ce || (!is_eml_file (dname) && ce->ce_mtime.sec != mtime)) {
+                    seaf_message ("File %s is changed, skip deleting it.\n", sub_path);
                     g_free (sub_path_w);
                     g_free (sub_path);
                     ret = -1;
@@ -5768,7 +5060,6 @@ delete_worktree_dir_recursive (struct index_state *istate,
     GError *error = NULL;
     char *sub_path, *full_sub_path;
     SeafStat st;
-    struct cache_entry *ce;
     int ret = 0;
     gboolean builtin_ignored = FALSE;
 
@@ -5797,10 +5088,12 @@ delete_worktree_dir_recursive (struct index_state *istate,
             if (delete_worktree_dir_recursive (istate, sub_path, full_sub_path) < 0)
                 ret = -1;
         } else {
+            struct cache_entry *ce;
             /* Files like .DS_Store and Thumbs.db should be deleted any way. */
             if (!builtin_ignored) {
                 ce = index_name_exists (istate, sub_path, strlen(sub_path), 0);
                 if (!ce || ce->ce_mtime.sec != st.st_mtime) {
+                    seaf_message ("File %s is changed, skip deleting it.\n", full_sub_path);
                     g_free (sub_path);
                     g_free (full_sub_path);
                     ret = -1;
@@ -5835,8 +5128,56 @@ delete_worktree_dir_recursive (struct index_state *istate,
 
 #endif  /* WIN32 */
 
+#define SEAFILE_RECYCLE_BIN_FOLDER "recycle-bin"
+
+static int
+move_dir_to_recycle_bin (const char *dir_path)
+{
+    char *trash_folder = g_build_path ("/", seaf->worktree_dir, SEAFILE_RECYCLE_BIN_FOLDER, NULL);
+    if (checkdir_with_mkdir (trash_folder) < 0) {
+        seaf_warning ("Seafile trash folder %s doesn't exist and cannot be created.\n",
+                      trash_folder);
+        g_free (trash_folder);
+        return -1;
+    }
+    g_free (trash_folder);
+
+    char *basename = g_path_get_basename (dir_path);
+    char *dst_path = g_build_path ("/", seaf->worktree_dir, SEAFILE_RECYCLE_BIN_FOLDER, basename, NULL);
+    int ret = 0;
+
+    int n;
+    char *tmp_path;
+    for (n = 1; n < 10; ++n) {
+        if (g_file_test (dst_path, G_FILE_TEST_EXISTS)) {
+            tmp_path = g_strdup_printf ("%s(%d)", dst_path, n);
+            g_free (dst_path);
+            dst_path = tmp_path;
+            continue;
+        }
+        break;
+    }
+
+    if (seaf_util_rename (dir_path, dst_path) < 0) {
+        seaf_warning ("Failed to move %s to Seafile recycle bin %s: %s\n",
+                      dir_path, dst_path, strerror(errno));
+        ret = -1;
+        goto out;
+    }
+
+    seaf_message ("Moved folder %s to Seafile recyle bin %s.\n",
+                  dir_path, dst_path);
+
+out:
+    g_free (basename);
+    g_free (dst_path);
+    return ret;
+}
+
 static void
-delete_worktree_dir (struct index_state *istate,
+delete_worktree_dir (const char *repo_id,
+                     const char *repo_name,
+                     struct index_state *istate,
                      const char *worktree,
                      const char *path)
 {
@@ -5849,6 +5190,16 @@ delete_worktree_dir (struct index_state *istate,
 #else
     delete_worktree_dir_recursive(istate, path, full_path);
 #endif
+
+    /* If for some reason the dir cannot be removed, try to move it to a trash folder
+     * under Seafile folder. Otherwise the removed folder will be created agian on the
+     * server, which will confuse the users.
+     */
+    if (g_file_test (full_path, G_FILE_TEST_EXISTS)) {
+        if (move_dir_to_recycle_bin (full_path) == 0)
+            send_file_sync_error_notification (repo_id, repo_name, path,
+                                               SYNC_ERROR_ID_REMOVE_UNCOMMITTED_FOLDER);
+    }
 
     g_free (full_path);
 }
@@ -5923,10 +5274,7 @@ convert_rename_to_checkout (const char *repo_id,
 #endif  /* WIN32 */
 
 int
-seaf_repo_fetch_and_checkout (TransferTask *task,
-                              HttpTxTask *http_task,
-                              gboolean is_http,
-                              const char *remote_head_id)
+seaf_repo_fetch_and_checkout (HttpTxTask *http_task, const char *remote_head_id)
 {
     char *repo_id;
     int repo_version;
@@ -5946,19 +5294,11 @@ seaf_repo_fetch_and_checkout (TransferTask *task,
     GList *ignore_list = NULL;
     LockedFileSet *fset = NULL;
 
-    if (is_http) {
-        repo_id = http_task->repo_id;
-        repo_version = http_task->repo_version;
-        is_clone = http_task->is_clone;
-        worktree = http_task->worktree;
-        passwd = http_task->passwd;
-    } else {
-        repo_id = task->repo_id;
-        repo_version = task->repo_version;
-        is_clone = task->is_clone;
-        worktree = task->worktree;
-        passwd = task->passwd;
-    }
+    repo_id = http_task->repo_id;
+    repo_version = http_task->repo_version;
+    is_clone = http_task->is_clone;
+    worktree = http_task->worktree;
+    passwd = http_task->passwd;
 
     memset (&istate, 0, sizeof(istate));
     snprintf (index_path, SEAF_PATH_MAX, "%s/%s",
@@ -6039,6 +5379,8 @@ seaf_repo_fetch_and_checkout (TransferTask *task,
             if (do_check_dir_locked (de->name, worktree)) {
                 seaf_message ("File(s) in dir %s are locked by other program, "
                               "skip rename/delete.\n", de->name);
+                send_file_sync_error_notification (repo_id, NULL, de->name,
+                                                   SYNC_ERROR_ID_FOLDER_LOCKED_BY_APP);
                 ret = FETCH_CHECKOUT_LOCKED;
                 goto out;
             }
@@ -6050,6 +5392,8 @@ seaf_repo_fetch_and_checkout (TransferTask *task,
             if (do_check_file_locked (de->name, worktree, locked_on_server)) {
                 seaf_message ("File %s is locked by other program, skip rename.\n",
                               de->name);
+                send_file_sync_error_notification (repo_id, NULL, de->name,
+                                                   SYNC_ERROR_ID_FILE_LOCKED_BY_APP);
                 ret = FETCH_CHECKOUT_LOCKED;
                 goto out;
             }
@@ -6067,6 +5411,7 @@ seaf_repo_fetch_and_checkout (TransferTask *task,
             seafile_decrypt_repo_enc_key (remote_head->enc_version,
                                           passwd,
                                           remote_head->random_key,
+                                          remote_head->salt,
                                           enc_key, enc_iv);
             crypt = seafile_crypt_new (remote_head->enc_version,
                                        enc_key, enc_iv);
@@ -6082,7 +5427,7 @@ seaf_repo_fetch_and_checkout (TransferTask *task,
 
     struct cache_entry *ce;
 
-#ifdef WIN32
+#if defined WIN32 || defined __APPLE__
     fset = seaf_repo_manager_get_locked_file_set (seaf->repo_mgr, repo_id);
 #endif
 
@@ -6091,7 +5436,7 @@ seaf_repo_fetch_and_checkout (TransferTask *task,
         if (de->status == DIFF_STATUS_DELETED) {
             seaf_debug ("Delete file %s.\n", de->name);
 
-            if (should_ignore_on_checkout (de->name)) {
+            if (should_ignore_on_checkout (de->name, NULL)) {
                 seaf_message ("Path %s is invalid on Windows, skip delete.\n",
                               de->name);
                 continue;
@@ -6108,14 +5453,14 @@ seaf_repo_fetch_and_checkout (TransferTask *task,
                 seaf_filelock_manager_unlock_wt_file (seaf->filelock_mgr,
                                                       repo_id, de->name);
 
-#ifdef WIN32
+#if defined WIN32 || defined __APPLE__
             if (!do_check_file_locked (de->name, worktree, locked_on_server)) {
                 locked_file_set_remove (fset, de->name, FALSE);
                 delete_path (worktree, de->name, de->mode, ce->ce_mtime.sec);
             } else {
-                if (is_http && !locked_file_set_lookup (fset, de->name))
-                    send_sync_error_notification (repo_id, http_task->repo_name, de->name,
-                                                  SYNC_ERROR_ID_FILE_LOCKED_BY_APP);
+                if (!locked_file_set_lookup (fset, de->name))
+                    send_file_sync_error_notification (repo_id, http_task->repo_name, de->name,
+                                                       SYNC_ERROR_ID_FILE_LOCKED_BY_APP);
 
                 locked_file_set_add_update (fset, de->name, LOCKED_OP_DELETE,
                                             ce->ce_mtime.sec, NULL);
@@ -6131,7 +5476,7 @@ seaf_repo_fetch_and_checkout (TransferTask *task,
         } else if (de->status == DIFF_STATUS_DIR_DELETED) {
             seaf_debug ("Delete dir %s.\n", de->name);
 
-            if (should_ignore_on_checkout (de->name)) {
+            if (should_ignore_on_checkout (de->name, NULL)) {
                 seaf_message ("Path %s is invalid on Windows, skip delete.\n",
                               de->name);
                 continue;
@@ -6141,7 +5486,7 @@ seaf_repo_fetch_and_checkout (TransferTask *task,
             if (!master_head || strcmp(master_head->root_id, EMPTY_SHA1) == 0)
                 continue;
 
-            delete_worktree_dir (&istate, worktree, de->name);
+            delete_worktree_dir (repo_id, http_task->repo_name, &istate, worktree, de->name);
 
             /* Remove all index entries under this directory */
             remove_from_index_with_prefix (&istate, de->name, NULL);
@@ -6157,14 +5502,20 @@ seaf_repo_fetch_and_checkout (TransferTask *task,
             seaf_debug ("Rename %s to %s.\n", de->name, de->new_name);
 
 #ifdef WIN32
-            if (should_ignore_on_checkout (de->new_name)) {
+            IgnoreReason reason;
+            if (should_ignore_on_checkout (de->new_name, &reason)) {
                 seaf_message ("Path %s is invalid on Windows, skip rename.\n", de->new_name);
-                if (is_http)
-                    send_sync_error_notification (repo_id, http_task->repo_name,
-                                                  de->new_name,
-                                                  SYNC_ERROR_ID_INVALID_PATH);
+
+                if (reason == IGNORE_REASON_END_SPACE_PERIOD)
+                    send_file_sync_error_notification (repo_id, http_task->repo_name,
+                                                       de->new_name,
+                                                       SYNC_ERROR_ID_PATH_END_SPACE_PERIOD);
+                else if (reason == IGNORE_REASON_INVALID_CHARACTER)
+                    send_file_sync_error_notification (repo_id, http_task->repo_name,
+                                                       de->new_name,
+                                                       SYNC_ERROR_ID_PATH_INVALID_CHARACTER);
                 continue;
-            } else if (should_ignore_on_checkout (de->name)) {
+            } else if (should_ignore_on_checkout (de->name, NULL)) {
                 /* If the server renames an invalid path to a valid path,
                  * directly checkout the valid path. The checkout will merge
                  * with any existing files.
@@ -6204,40 +5555,22 @@ seaf_repo_fetch_and_checkout (TransferTask *task,
     for (ptr = results; ptr; ptr = ptr->next) {
         de = ptr->data;
         if (de->status == DIFF_STATUS_ADDED || de->status == DIFF_STATUS_MODIFIED) {
-            if (!is_http)
-                ++(task->n_to_download);
-            else
-                ++(http_task->n_files);
+            http_task->total_download += de->size;
         }
     }
 
-    if (is_http) {
-        ret = download_files_http (repo_id,
-                                   repo_version,
-                                   worktree,
-                                   &istate,
-                                   index_path,
-                                   crypt,
-                                   http_task,
-                                   results,
-                                   conflict_hash,
-                                   no_conflict_hash,
-                                   remote_head_id,
-                                   fset);
-    } else {
-        ret = download_files_no_http (repo_id,
-                                      repo_version,
-                                      worktree,
-                                      &istate,
-                                      index_path,
-                                      crypt,
-                                      task,
-                                      results,
-                                      conflict_hash,
-                                      no_conflict_hash,
-                                      remote_head_id,
-                                      fset);
-    }
+    ret = download_files_http (repo_id,
+                               repo_version,
+                               worktree,
+                               &istate,
+                               index_path,
+                               crypt,
+                               http_task,
+                               results,
+                               conflict_hash,
+                               no_conflict_hash,
+                               remote_head_id,
+                               fset);
 
 out:
     discard_index (&istate);
@@ -6257,7 +5590,7 @@ out:
     if (ignore_list)
         seaf_repo_free_ignore_files (ignore_list);
 
-#ifdef WIN32
+#if defined WIN32 || defined __APPLE__
     locked_file_set_free (fset);
 #endif
 
@@ -6376,10 +5709,6 @@ seaf_repo_manager_init (SeafRepoManager *mgr)
                    mgr->index_dir);
         return -1;
     }
-
-    mgr->priv->cevent_id = cevent_manager_register (seaf->ev_mgr,
-                                                    (cevent_handler)notify_sync_error,
-                                                    NULL);
 
     /* Load all the repos into memory on the client side. */
     load_repos (mgr, mgr->seaf->seaf_dir);
@@ -6511,17 +5840,20 @@ int
 seaf_repo_manager_start (SeafRepoManager *mgr)
 {
     pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     int rc;
 
     watch_repos (mgr);
 
-    rc = pthread_create (&tid, NULL, cleanup_deleted_stores, NULL);
+    rc = pthread_create (&tid, &attr, cleanup_deleted_stores, NULL);
     if (rc != 0) {
         seaf_warning ("Failed to start cleanup thread: %s\n", strerror(rc));
     }
 
-#ifdef WIN32
-    rc = pthread_create (&tid, NULL, lock_office_file_worker,
+#if defined WIN32 || defined __APPLE__
+    rc = pthread_create (&tid, &attr, lock_office_file_worker,
                          mgr->priv->lock_office_job_queue);
     if (rc != 0) {
         seaf_warning ("Failed to start lock office file thread: %s\n", strerror(rc));
@@ -6717,11 +6049,9 @@ seaf_repo_manager_remove_repo_ondisk (SeafRepoManager *mgr,
               repo_id);
     sqlite_query_exec (mgr->priv->db, sql);
 
-#ifdef WIN32
     snprintf (sql, sizeof(sql), "DELETE FROM LockedFiles WHERE repo_id = '%s'",
               repo_id);
     sqlite_query_exec (mgr->priv->db, sql);
-#endif
 
     snprintf (sql, sizeof(sql), "DELETE FROM FolderUserPerms WHERE repo_id = '%s'", 
               repo_id);
@@ -6936,7 +6266,7 @@ load_keys_cb (sqlite3_stmt *stmt, void *vrepo)
     if (repo->enc_version == 1) {
         hex_to_rawdata (key, repo->enc_key, 16);
         hex_to_rawdata (iv, repo->enc_iv, 16);
-    } else if (repo->enc_version == 2) {
+    } else if (repo->enc_version >= 2) {
         hex_to_rawdata (key, repo->enc_key, 32);
         hex_to_rawdata (iv, repo->enc_iv, 16);
     }
@@ -7026,6 +6356,16 @@ load_branch_cb (sqlite3_stmt *stmt, void *vrepo)
     return FALSE;
 }
 
+static gboolean
+is_wt_repo_name_same (const char *worktree, const char *repo_name)
+{
+    char *basename = g_path_get_basename (worktree);
+    gboolean ret = FALSE;
+    ret = (g_strcmp0 (basename, repo_name) == 0);
+    g_free (basename);
+    return ret;
+}
+
 static SeafRepo *
 load_repo (SeafRepoManager *manager, const char *repo_id)
 {
@@ -7104,12 +6444,6 @@ load_repo (SeafRepoManager *manager, const char *repo_id)
     if (repo->worktree)
         repo->worktree_invalid = FALSE;
 
-    repo->relay_id = load_repo_property (manager, repo->id, REPO_RELAY_ID);
-    if (repo->relay_id && strlen(repo->relay_id) != 40) {
-        g_free (repo->relay_id);
-        repo->relay_id = NULL;
-    }
-
     repo->email = load_repo_property (manager, repo->id, REPO_PROP_EMAIL);
     repo->token = load_repo_property (manager, repo->id, REPO_PROP_TOKEN);
 
@@ -7145,6 +6479,23 @@ load_repo (SeafRepoManager *manager, const char *repo_id)
             repo->sync_interval = interval;
     }
     g_free (value);
+
+    if (repo->worktree) {
+        gboolean wt_repo_name_same = is_wt_repo_name_same (repo->worktree, repo->name);
+        value = load_repo_property (manager, repo->id, REPO_SYNC_WORKTREE_NAME);
+        if (g_strcmp0 (value, "true") == 0) {
+            /* If need to sync worktree name with library name, update worktree folder name. */
+            if (!wt_repo_name_same)
+                update_repo_worktree_name (repo, repo->name, FALSE);
+        } else {
+            /* If an existing repo's worktree folder name is the same as repo name, but
+             * sync_worktree_name property is not set, set it.
+             */
+            if (wt_repo_name_same)
+                save_repo_property (manager, repo->id, REPO_SYNC_WORKTREE_NAME, "true");
+        }
+        g_free (value);
+    }
 
     g_hash_table_insert (manager->priv->repo_hash, g_strdup(repo->id), repo);
 
@@ -7211,12 +6562,10 @@ open_db (SeafRepoManager *manager, const char *seaf_dir)
     sql = "CREATE TABLE IF NOT EXISTS GarbageRepos (repo_id TEXT PRIMARY KEY);";
     sqlite_query_exec (db, sql);
 
-#ifdef WIN32
     sql = "CREATE TABLE IF NOT EXISTS LockedFiles (repo_id TEXT, path TEXT, "
         "operation TEXT, old_mtime INTEGER, file_id TEXT, new_path TEXT, "
         "PRIMARY KEY (repo_id, path));";
     sqlite_query_exec (db, sql);
-#endif
 
     sql = "CREATE TABLE IF NOT EXISTS FolderUserPerms ("
         "repo_id TEXT, path TEXT, permission TEXT);";
@@ -7243,6 +6592,14 @@ open_db (SeafRepoManager *manager, const char *seaf_dir)
     sqlite_query_exec (db, sql);
 
     sql = "CREATE INDEX IF NOT EXISTS ServerIndex ON ServerProperty (server_url);";
+    sqlite_query_exec (db, sql);
+
+    sql = "CREATE TABLE IF NOT EXISTS FileSyncError ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, repo_id TEXT, repo_name TEXT, "
+        "path TEXT, err_id INTEGER, timestamp INTEGER);";
+    sqlite_query_exec (db, sql);
+
+    sql = "CREATE INDEX IF NOT EXISTS FileSyncErrorIndex ON FileSyncError (repo_id, path)";
     sqlite_query_exec (db, sql);
 
     return db;
@@ -7325,37 +6682,6 @@ save_repo_property (SeafRepoManager *manager,
     pthread_mutex_unlock (&manager->priv->db_lock);
 }
 
-inline static gboolean is_peer_relay (const char *peer_id)
-{
-    CcnetPeer *peer = ccnet_get_peer(seaf->ccnetrpc_client, peer_id);
-
-    if (!peer)
-        return FALSE;
-
-    gboolean is_relay = string_list_is_exists(peer->role_list, "MyRelay");
-    g_object_unref (peer);
-    return is_relay;
-}
-
-int
-seaf_repo_manager_set_repo_relay_id (SeafRepoManager *mgr,
-                                     SeafRepo *repo,
-                                     const char *relay_id)
-{
-    if (relay_id && strlen(relay_id) != 40)
-        return -1;
-
-    save_repo_property (mgr, repo->id, REPO_RELAY_ID, relay_id);
-
-    g_free (repo->relay_id);
-
-    if (relay_id)
-        repo->relay_id = g_strdup (relay_id);
-    else
-        repo->relay_id = NULL;        
-    return 0;
-}
-
 static char *
 canonical_server_url (const char *url_in)
 {
@@ -7422,9 +6748,6 @@ seaf_repo_manager_set_repo_property (SeafRepoManager *manager,
         }
     }
 
-    if (strcmp(key, REPO_RELAY_ID) == 0)
-        return seaf_repo_manager_set_repo_relay_id (manager, repo, value);
-
     if (strcmp (key, REPO_PROP_SERVER_URL) == 0) {
         char *url = canonical_server_url (value);
 
@@ -7441,6 +6764,13 @@ seaf_repo_manager_set_repo_property (SeafRepoManager *manager,
 
         save_repo_property (manager, repo_id, key, url);
         return 0;
+    }
+
+    if (strcmp (key, REPO_PROP_IS_READONLY) == 0) {
+       if (g_strcmp0 (value, "true") == 0)
+           repo->is_readonly = TRUE;
+       else
+           repo->is_readonly = FALSE;
     }
 
     save_repo_property (manager, repo_id, key, value);
@@ -7501,7 +6831,7 @@ save_repo_enc_info (SeafRepoManager *manager,
     if (repo->enc_version == 1) {
         rawdata_to_hex (repo->enc_key, key, 16);
         rawdata_to_hex (repo->enc_iv, iv, 16);
-    } else if (repo->enc_version == 2) {
+    } else if (repo->enc_version >= 2) {
         rawdata_to_hex (repo->enc_key, key, 32);
         rawdata_to_hex (repo->enc_iv, iv, 16);
     }
@@ -7522,6 +6852,7 @@ seaf_repo_manager_set_repo_passwd (SeafRepoManager *manager,
     int ret;
 
     if (seafile_decrypt_repo_enc_key (repo->enc_version, passwd, repo->random_key,
+                                      repo->salt,
                                       repo->enc_key, repo->enc_iv) < 0)
         return -1;
 
@@ -7531,153 +6862,6 @@ seaf_repo_manager_set_repo_passwd (SeafRepoManager *manager,
 
     pthread_mutex_unlock (&manager->priv->db_lock);
 
-    return ret;
-}
-
-int
-seaf_repo_manager_set_merge (SeafRepoManager *manager,
-                             const char *repo_id,
-                             const char *remote_head)
-{
-    char sql[256];
-
-    pthread_mutex_lock (&manager->priv->db_lock);
-
-    snprintf (sql, sizeof(sql), "REPLACE INTO MergeInfo VALUES ('%s', 1, '%s');",
-              repo_id, remote_head);
-    int ret = sqlite_query_exec (manager->priv->db, sql);
-
-    pthread_mutex_unlock (&manager->priv->db_lock);
-    return ret;
-}
-
-int
-seaf_repo_manager_clear_merge (SeafRepoManager *manager,
-                               const char *repo_id)
-{
-    char sql[256];
-
-    pthread_mutex_lock (&manager->priv->db_lock);
-
-    snprintf (sql, sizeof(sql), "UPDATE MergeInfo SET in_merge=0 WHERE repo_id='%s';",
-              repo_id);
-    int ret = sqlite_query_exec (manager->priv->db, sql);
-
-    pthread_mutex_unlock (&manager->priv->db_lock);
-    return ret;
-}
-
-static gboolean
-get_merge_info (sqlite3_stmt *stmt, void *vinfo)
-{
-    SeafRepoMergeInfo *info = vinfo;
-    int in_merge;
-
-    in_merge = sqlite3_column_int (stmt, 1);
-    if (in_merge == 0)
-        info->in_merge = FALSE;
-    else
-        info->in_merge = TRUE;
-
-    /* 
-     * Note that compatibility, we store remote_head in the "branch" column.
-     */
-    const char *remote_head = (const char *) sqlite3_column_text (stmt, 2);
-    memcpy (info->remote_head, remote_head, 40);
-
-    return FALSE;
-}
-
-int
-seaf_repo_manager_get_merge_info (SeafRepoManager *manager,
-                                  const char *repo_id,
-                                  SeafRepoMergeInfo *info)
-{
-    char sql[256];
-
-    /* Default not in_merge, if no row is found in db. */
-    info->in_merge = FALSE;
-
-    pthread_mutex_lock (&manager->priv->db_lock);
-
-    snprintf (sql, sizeof(sql), "SELECT * FROM MergeInfo WHERE repo_id='%s';",
-              repo_id);
-    if (sqlite_foreach_selected_row (manager->priv->db, sql,
-                                     get_merge_info, info) < 0) {
-        pthread_mutex_unlock (&manager->priv->db_lock);
-        return -1;
-    }
-
-    pthread_mutex_unlock (&manager->priv->db_lock);
-
-    return 0;
-}
-
-typedef struct {
-    char common_ancestor[41];
-    char head_id[41];
-} CAInfo;
-
-static gboolean
-get_common_ancestor (sqlite3_stmt *stmt, void *vinfo)
-{
-    CAInfo *info = vinfo;
-
-    const char *ancestor = (const char *) sqlite3_column_text (stmt, 0);
-    const char *head_id = (const char *) sqlite3_column_text (stmt, 1);
-
-    memcpy (info->common_ancestor, ancestor, 40);
-    memcpy (info->head_id, head_id, 40);
-
-    return FALSE;
-}
-
-int
-seaf_repo_manager_get_common_ancestor (SeafRepoManager *manager,
-                                       const char *repo_id,
-                                       char *common_ancestor,
-                                       char *head_id)
-{
-    char sql[256];
-    CAInfo info;
-
-    memset (&info, 0, sizeof(info));
-
-    pthread_mutex_lock (&manager->priv->db_lock);
-
-    snprintf (sql, sizeof(sql),
-              "SELECT ca_id, head_id FROM CommonAncestor WHERE repo_id='%s';",
-              repo_id);
-    if (sqlite_foreach_selected_row (manager->priv->db, sql,
-                                     get_common_ancestor, &info) < 0) {
-        pthread_mutex_unlock (&manager->priv->db_lock);
-        return -1;
-    }
-
-    pthread_mutex_unlock (&manager->priv->db_lock);
-
-    memcpy (common_ancestor, info.common_ancestor, 41);
-    memcpy (head_id, info.head_id, 41);
-
-    return 0;
-}
-
-int
-seaf_repo_manager_set_common_ancestor (SeafRepoManager *manager,
-                                       const char *repo_id,
-                                       const char *common_ancestor,
-                                       const char *head_id)
-{
-    char sql[256];
-
-    pthread_mutex_lock (&manager->priv->db_lock);
-
-    snprintf (sql, sizeof(sql),
-              "REPLACE INTO CommonAncestor VALUES ('%s', '%s', '%s');",
-              repo_id, common_ancestor, head_id);
-    int ret = sqlite_query_exec (manager->priv->db, sql);
-
-    pthread_mutex_unlock (&manager->priv->db_lock);
     return ret;
 }
 
@@ -7706,125 +6890,29 @@ seaf_repo_manager_get_repo_list (SeafRepoManager *manager, int start, int limit)
     return repo_list;
 }
 
-typedef struct {
-    SeafRepo                *repo;
-    CheckoutTask            *task;
-    CheckoutDoneCallback     done_cb;
-    void                    *cb_data;
-} CheckoutData;
-
-static void
-checkout_job_done (void *vresult)
+GList *
+seaf_repo_manager_get_repo_id_list_by_server (SeafRepoManager *manager, const char *server_url)
 {
-    if (!vresult)
-        return;
-    CheckoutData *cdata = vresult;
-    SeafRepo *repo = cdata->repo;
-    SeafBranch *local = NULL;
+    GList *repo_id_list = NULL;
+    GHashTableIter iter;
+    SeafRepo *repo;
+    gpointer key, value;
 
-    if (!cdata->task->success)
-        goto out;
-
-    seaf_repo_manager_set_repo_worktree (repo->manager,
-                                         repo,
-                                         cdata->task->worktree);
-
-    local = seaf_branch_manager_get_branch (seaf->branch_mgr, repo->id, "local");
-    if (!local) {
-        seaf_warning ("Cannot get branch local for repo %s(%.10s).\n",
-                      repo->name, repo->id);
-        return;
-    }
-    /* Set repo head to mark checkout done. */
-    seaf_repo_set_head (repo, local);
-    seaf_branch_unref (local);
-
-    if (repo->auto_sync && (repo->sync_interval == 0)) {
-        if (seaf_wt_monitor_watch_repo (seaf->wt_monitor, repo->id, repo->worktree) < 0) {
-            seaf_warning ("failed to watch repo %s(%.10s).\n", repo->name, repo->id);
-            return;
-        }
-    }
-
-out:
-    if (cdata->done_cb)
-        cdata->done_cb (cdata->task, cdata->repo, cdata->cb_data);
-
-    /* g_hash_table_remove (mgr->priv->checkout_tasks_hash, cdata->repo->id); */
-}
-
-static void *
-checkout_repo_job (void *data)
-{
-    SeafRepoManager *mgr = seaf->repo_mgr;
-    CheckoutData *cdata = data;
-    SeafRepo *repo = cdata->repo;
-    CheckoutTask *task;
-
-    task = g_hash_table_lookup (mgr->priv->checkout_tasks_hash, repo->id);
-    if (!task) {
-        seaf_warning ("Failed to find checkout task for repo %.10s\n", repo->id);
+    if (pthread_rwlock_rdlock (&manager->priv->lock) < 0) {
+        seaf_warning ("[repo mgr] failed to lock repo cache.\n");
         return NULL;
     }
+    g_hash_table_iter_init (&iter, manager->priv->repo_hash);
 
-    repo->worktree = g_strdup (task->worktree);
-
-    char *error_msg = NULL;
-    if (seaf_repo_checkout (repo, task->worktree, &error_msg) < 0) {
-        seaf_warning ("Failed to checkout repo %.10s to %s : %s\n",
-                      repo->id, task->worktree, error_msg);
-        g_free (error_msg);
-        task->success = FALSE;
-        goto ret;
-    }
-    task->success = TRUE;
-
-ret:
-    return data;
-}
-
-int
-seaf_repo_manager_add_checkout_task (SeafRepoManager *mgr,
-                                     SeafRepo *repo,
-                                     const char *worktree,
-                                     CheckoutDoneCallback done_cb,
-                                     void *cb_data)
-{
-    if (!repo || !worktree) {
-        seaf_warning ("Invaid args\n");
-        return -1;
+    while (g_hash_table_iter_next (&iter, &key, &value)) {
+        repo = value;
+        if (!repo->delete_pending && g_strcmp0 (repo->server_url, server_url) == 0)
+            repo_id_list = g_list_prepend (repo_id_list, g_strdup(repo->id));
     }
 
-    CheckoutTask *task = g_new0 (CheckoutTask, 1);
-    memcpy (task->repo_id, repo->id, 36);
-    g_return_val_if_fail (strlen(worktree) < SEAF_PATH_MAX, -1);
-    strcpy (task->worktree, worktree);
+    pthread_rwlock_unlock (&manager->priv->lock);
 
-    g_hash_table_insert (mgr->priv->checkout_tasks_hash,
-                         g_strdup(repo->id), task);
-
-    CheckoutData *cdata = g_new0 (CheckoutData, 1);
-    cdata->repo = repo;
-    cdata->task = task;
-    cdata->done_cb = done_cb;
-    cdata->cb_data = cb_data;
-    ccnet_job_manager_schedule_job(seaf->job_mgr,
-                                   (JobThreadFunc)checkout_repo_job,
-                                   (JobDoneCallback)checkout_job_done,
-                                   cdata);
-    return 0;
-}
-
-CheckoutTask *
-seaf_repo_manager_get_checkout_task (SeafRepoManager *mgr,
-                                     const char *repo_id)
-{
-    if (!repo_id || strlen(repo_id) != 36) {
-        seaf_warning ("Invalid args\n");
-        return NULL;
-    }
-
-    return g_hash_table_lookup(mgr->priv->checkout_tasks_hash, repo_id);
+    return repo_id_list;
 }
 
 int
@@ -7888,38 +6976,6 @@ seaf_repo_manager_get_repo_relay_info (SeafRepoManager *mgr,
         *relay_addr = addr;
     if (relay_port && port)
         *relay_port = port;
-}
-
-int
-seaf_repo_manager_update_repo_relay_info (SeafRepoManager *mgr,
-                                          SeafRepo *repo,
-                                          const char *new_addr,
-                                          const char *new_port)
-{
-    GList *ptr, *repos = seaf_repo_manager_get_repo_list (seaf->repo_mgr, 0, -1);
-    SeafRepo *r;
-    for (ptr = repos; ptr; ptr = ptr->next) {
-        r = ptr->data;
-        if (g_strcmp0(r->relay_id, repo->relay_id) != 0)
-            continue;
-
-        char *relay_addr = NULL;
-        char *relay_port = NULL;
-        seaf_repo_manager_get_repo_relay_info (seaf->repo_mgr, r->id,
-                                               &relay_addr, &relay_port);
-        if (g_strcmp0(relay_addr, new_addr) != 0 ||
-            g_strcmp0(relay_port, new_port) != 0) {
-            seaf_repo_manager_set_repo_relay_info (seaf->repo_mgr, r->id,
-                                                   new_addr, new_port);
-        }
-
-        g_free (relay_addr);
-        g_free (relay_port);
-    }
-
-    g_list_free (repos);
-
-    return 0;
 }
 
 static void

@@ -7,6 +7,7 @@
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x500
 #endif
+#include <winsock2.h>
 #include <windows.h>
 #endif
 
@@ -42,33 +43,13 @@
 #define WEXITSTATUS(status) (((status) & 0xff00) >> 8)
 #endif
 
-/* Borrowed from libevent */
-#define ccnet_pipe_t intptr_t
-
-int pgpipe (ccnet_pipe_t handles[2]);
-/* Should only be called in main loop. */
-#define ccnet_pipe(a) pgpipe((a))
-#define piperead(a,b,c) recv((a),(b),(c),0)
-#define pipewrite(a,b,c) send((a),(b),(c),0)
-#define pipeclose(a) closesocket((a))
-
 #define SeafStat struct __stat64
 
 #else
 
-#define ccnet_pipe_t int
-
-#define ccnet_pipe(a) pipe((a))
-#define piperead(a,b,c) read((a),(b),(c))
-#define pipewrite(a,b,c) write((a),(b),(c))
-#define pipeclose(a) close((a))
-
 #define SeafStat struct stat
 
 #endif
-
-#define pipereadn(a,b,c) recvn((a),(b),(c))
-#define pipewriten(a,b,c) sendn((a),(b),(c))
 
 int seaf_stat (const char *path, SeafStat *st);
 int seaf_fstat (int fd, SeafStat *st);
@@ -133,6 +114,32 @@ traverse_directory_win32 (wchar_t *path_w,
 #define O_BINARY 0
 #endif
 
+#ifdef WIN32
+#define seaf_pipe_t intptr_t
+#else
+#define seaf_pipe_t int
+#endif
+
+int
+seaf_pipe (seaf_pipe_t handles[2]);
+int
+seaf_pipe_read (seaf_pipe_t fd, char *buf, int len);
+int
+seaf_pipe_write (seaf_pipe_t fd, const char *buf, int len);
+int
+seaf_pipe_close (seaf_pipe_t fd);
+
+ssize_t seaf_pipe_readn (seaf_pipe_t fd, void *vptr, size_t n);
+ssize_t seaf_pipe_writen (seaf_pipe_t fd, const void *vptr, size_t n);
+
+typedef enum IgnoreReason {
+    IGNORE_REASON_END_SPACE_PERIOD = 0,
+    IGNORE_REASON_INVALID_CHARACTER = 1,
+} IgnoreReason;
+
+gboolean
+should_ignore_on_checkout (const char *file_path, IgnoreReason *ignore_reason);
+
 /* for debug */
 #ifndef ccnet_warning
 #define ccnet_warning(fmt, ...) g_warning("%s(%d): " fmt, __FILE__, __LINE__, ##__VA_ARGS__)
@@ -147,9 +154,6 @@ traverse_directory_win32 (wchar_t *path_w,
 #endif
 
 #define CCNET_DOMAIN g_quark_from_string("ccnet")
-
-
-struct timeval timeval_from_msec (uint64_t milliseconds);
 
 
 size_t ccnet_strlcpy (char *dst, const char *src, size_t size);
@@ -235,28 +239,11 @@ void nfree_string_array (char **array, int n);
 /* 64bit time */
 gint64 get_current_time();
 
-int
-ccnet_encrypt (char **data_out,
-               int *out_len,
-               const char *data_in,
-               const int in_len,
-               const char *code,
-               const int code_len);
-
-
-int
-ccnet_decrypt (char **data_out,
-               int *out_len,
-               const char *data_in,
-               const int in_len,
-               const char *code,
-               const int code_len);
-
-
 /*
  * Utility functions for converting data to/from network byte order.
  */
 
+#if !defined(__NetBSD__)
 static inline uint64_t
 bswap64 (uint64_t val)
 {
@@ -274,6 +261,7 @@ bswap64 (uint64_t val)
 
     return ret;
 }
+#endif
 
 static inline uint64_t
 hton64(uint64_t val)
@@ -404,5 +392,8 @@ is_empty_string (const char *str);
 
 gboolean
 is_permission_valid (const char *perm);
+
+gboolean
+is_eml_file (const char *path);
 
 #endif

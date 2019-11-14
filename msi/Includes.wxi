@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Include Id="SeafileInclude">
-  <?define CurrentSeafileVersion="6.0.1" ?>
+  <?define CurrentSeafileVersion="7.0.3" ?>
 
   <!-- Update Guid 不能变 -->
   <?define CurrentUpdateGuid="65DED1C8-A5F1-4C49-8E7E-B0A8A5A6535C" ?>
@@ -106,22 +106,38 @@
   <!-- <?define ProductGuid="91E61552-02F8-42B1-A07D-3848D26AEDCD" ?> (5.1.3) -->
   <!-- <?define ProductGuid="8A1698E3-92C5-40BB-A22D-501B42462406" ?> (5.1.4) -->
   <!-- <?define ProductGuid="3AEA122D-C7E8-45C4-8E5E-44A8EC4367B0" ?> (6.0.0) -->
-  <?define ProductGuid="B101E268-D594-46F6-B63D-E588EEE8A034" ?>
+  <!-- <?define ProductGuid="B101E268-D594-46F6-B63D-E588EEE8A034" ?> (6.0.1) -->
+  <!-- <?define ProductGuid="8C8B8595-6F49-4330-AF6C-F3C538F86735" ?> (6.0.2) -->
+  <!-- <?define ProductGuid="243265EE-AC28-4DC0-8924-2C053162E7C1" ?> (6.0.3) -->
+  <!-- <?define ProductGuid="AB555D53-FA35-4907-AFEF-BBC2DB45B6F4" ?> (6.0.4) -->
+  <!-- <?define ProductGuid="2B1F1C4C-2E90-478D-B1D2-9CEC389AE0D8" ?> (6.0.6) -->
+  <!-- <?define ProductGuid="1813B8A3-A52B-4293-B166-DF5A517480AC" ?> (6.0.7) -->
+  <!-- <?define ProductGuid="9AF9DA7F-436C-4519-A932-F543165F0E1A" ?> (6.1.0) -->
+  <!-- <?define ProductGuid="38269809-1417-4275-882B-FB92A69904AC" ?> (6.1.1) -->
+  <!-- <?define ProductGuid="FE039BE0-4B78-48AE-8453-A016810303E0" ?> (6.1.2) -->
+  <!-- <?define ProductGuid="49EA51FA-BDA0-44A3-A89A-1F355B8A40D7" ?> (6.1.3) -->
+  <!-- <?define ProductGuid="D984BE8C-C01C-42F3-B5DE-2DB03657E29B" ?> (6.1.4) -->
+  <!-- <?define ProductGuid="0E39500A-BAF7-4201-B955-C4E0762B85F1" ?> (6.1.5) -->
+  <!-- <?define ProductGuid="53BBECBF-F2C6-4B5E-A9A8-A115C513E521" ?> (6.1.6) -->
+  <!-- <?define ProductGuid="D67C7342-2DE3-485C-B8E2-5838EC64F49D" ?> (6.1.7) -->
+  <!-- <?define ProductGuid="7A5BD4DF-4698-415C-ADA8-A16009B73F37" ?> (6.1.8) -->
+  <!-- <?define ProductGuid="30C539BA-90F0-4F06-88E0-6BBEFB038EBE" ?> (6.2.0) -->
+  <!-- <?define ProductGuid="63B2D0B3-2130-4FC5-A2B8-3680399C65B2" ?> (6.2.1) -->
+  <!-- <?define ProductGuid="BA879197-CBF6-4DFB-BD56-E20A2854AFF9" ?> (6.2.2) -->
+  <!-- <?define ProductGuid="93D5D0EB-C2A5-41D3-BCFD-7D876CED74A3" ?> (6.2.3) -->
+  <!-- <?define ProductGuid="51C2F305-9C2A-4DB2-84A0-BE504813ADAF" ?> (6.2.4) -->
+  <!-- <?define ProductGuid="CD288D11-BBB8-4CAB-80E2-25B499F0E0D5" ?> (6.2.5) -->
+  <!-- <?define ProductGuid="1809B194-5373-429E-A32C-5188B3A05679" ?> (6.2.7) -->
+  <!-- <?define ProductGuid="FABC1D45-7C57-4D03-B136-669F66B8CC62" ?> (6.2.8) -->
+  <!-- <?define ProductGuid="4B890A1D-FBC4-427D-AF56-3A4FE393318A" ?> (6.2.9) -->
+  <!-- <?define ProductGuid="8F51E7B1-AE22-4AdC-8375-2675595F6D0B" ?> (6.2.10) -->
+  <!-- <?define ProductGuid="8284058D-781C-48BC-95C3-9B3146AEFA79" ?> (6.2.11) -->
+  <!-- <?define ProductGuid="9486761D-9F70-4E8E-AA1B-D460F1EF4F42" ?> (7.0.0) -->
+  <!-- <?define ProductGuid="706266F6-B2C5-4170-9DB1-0F4A586E614F" ?> (7.0.1) -->
+  <!-- <?define ProductGuid="86D3A1B2-E429-4E75-8367-A6907FFAB6E4" ?> (7.0.2) -->
+  <?define ProductGuid="DA63DC60-BAAD-45CF-B1CF-AECF7CDD8842" ?>
 
-  <?define ShellGuidContextMenu="D14BEDD3-4E05-4F2F-B0DE-C0381E6AE606" ?>
-  <?define  ShellGuidIconNormal="D14BEDD3-4E05-4F2F-B0DE-C0381E6AE607" ?>
-  <?define ShellGuidIconSyncing="D14BEDD3-4E05-4F2F-B0DE-C0381E6AE608" ?>
-  <?define   ShellGuidIconError="D14BEDD3-4E05-4F2F-B0DE-C0381E6AE609" ?>
-  <?define  ShellGuidIconPaused="D14BEDD3-4E05-4F2F-B0DE-C0381E6AE610" ?>
-  <?define     ShellGuidIconLockedByMe="D14BEDD3-4E05-4F2F-B0DE-C0381E6AE611" ?>
-  <?define ShellGuidIconLockedByOthers="D14BEDD3-4E05-4F2F-B0DE-C0381E6AE612" ?>
-
-  <?define GuidOfShellExtComponent="A2B35A93-F6DD-4524-BFF1-158C81011E93" ?>
-  <?define GuidOfManualComponent="F0CC8900-F8B9-11E1-83FD-000C295059FB" ?>
-  <?define GuidOfCustomComponent="A8CD54F6-9BFB-11E1-9B0E-001CBFC5CA1D" ?>
-  <?define GuidOfAutoStartComponent="FED41B85-BA5A-4C95-8ABF-4A35852EE04E" ?>
-  <?define GuidOfStartMenuShortCutComponent="F1662C95-6C0A-4CDD-B009-C5E66A4F8C80" ?>
-  <?define GuidOf32BitShellComponent="DAB96469-FFCE-4723-BD50-03AEBA4D36BD" ?>
-  <?define GuidOf64BitShellComponent="EEA7C4A2-4CCB-4185-BDA0-BDBD8D90B817" ?>
-
+  <?define GuidOfCustomComponent="AD201805-3CBD-4834-9097-5D934F7E0000" ?>
+  <?define GuidOfAutoStartComponent="AD201805-3CBD-4834-9097-5D934F7E0001" ?>
+  <?define GuidOfStartMenuShortCutComponent="AD201805-3CBD-4834-9097-5D934F7E0002" ?>
 </Include>

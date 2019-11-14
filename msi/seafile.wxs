@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
   <?include Includes.wxi?>
+  <?include ext.wxi?>
   <Product Id="$(var.ProductGuid)"
            Name='!(loc.AppName) $(var.CurrentSeafileVersion)'
            Language='1033'
@@ -15,8 +17,44 @@
              InstallPrivileges='elevated' InstallScope='perMachine'
              Compressed='yes' />
 
+    <!-- http://wixtoolset.org/documentation/manual/v3/howtos/ui_and_localization/configure_arp_appearance.html -->
+    <Icon Id="icon.ico" SourceFile="seafile.ico"/>
+    <Property Id="ARPPRODUCTICON" Value="icon.ico" />
+
     <!-- Don't allow downgrade. -->
     <MajorUpgrade DowngradeErrorMessage='!(loc.DowngradeErrorMessage)' />
+
+    <Property Id="SUPPRESS_LAUNCH_SEAFILE_AFTER_INSTALL_FINISH">
+      <RegistrySearch Id="SuppressLaunchSeafileHKCU"
+                      Root="HKCU"
+                      Key="SOFTWARE\!(loc.AppName)"
+                      Name="PreconfigureSuppressLaunchAfterInstall"
+                      Type="raw"
+                        />
+
+      <RegistrySearch Id="SuppressLaunchSeafileHKCU64"
+                      Root="HKCU"
+                      Key="SOFTWARE\!(loc.AppName)"
+                      Name="PreconfigureSuppressLaunchAfterInstall"
+                      Type="raw"
+                      Win64="yes"
+                      />
+
+      <RegistrySearch Id="SuppressLaunchSeafileHKLM"
+                      Root="HKLM"
+                      Key="SOFTWARE\!(loc.AppName)"
+                      Name="PreconfigureSuppressLaunchAfterInstall"
+                      Type="raw"
+                      />
+
+      <RegistrySearch Id="SuppressLaunchSeafileHKLM64"
+                      Root="HKLM"
+                      Key="SOFTWARE\!(loc.AppName)"
+                      Name="PreconfigureSuppressLaunchAfterInstall"
+                      Type="raw"
+                      Win64="yes"
+                      />
+    </Property>
 
     <Media Id='1' Cabinet='seafile.cab' EmbedCab='yes' />
 
@@ -26,25 +64,28 @@
         <Directory Id="SeafileStartMenuFolder" Name='!(loc.AppName)' />
       </Directory>
 
-      <Directory Id='AppDataFolder' Name='AFiles'>
-        <Directory Id='SeafileExtDir' Name='!(loc.AppName)'>
-          <Component Id="seafile_shell_ext" Guid="$(var.GuidOfShellExtComponent)">
+      <Directory Id='CommonAppDataFolder' Name='AllUsersHome'>
+        <Directory Id='SeafileExtDir' Name='$(var.ExtName)'>
+          <Component Id="seafile_ext" Guid="$(var.GuidOfShellExtComponent)">
+            <CreateFolder>
+              <!-- Set the permission of the SeafileExt folder. So,
+                   together with the MoveExtDll/MoveExtDll64 custom
+                   action, we can rename seafile shell ext dll to
+                   avoid "file in use" dialog. -->
+              <util:PermissionEx User="Users" GenericAll="yes" />
+            </CreateFolder>
             <RemoveFolder Id="SeafileExtDir" On="uninstall" />
             <RegistryValue Root="HKCU" Key="Software\[Manufacturer]\[ProductName]"
                            Name="shellext" Type="integer" Value="1" KeyPath='yes' />
 
-            <File Id="seafile_shell_ext.dll" Name="seafile_shell_ext.dll" Source="custom\seafile_shell_ext.dll" />
-            <File Id="seafile_shell_ext64.dll" Name="seafile_shell_ext64.dll" Source="custom\seafile_shell_ext64.dll" />
+            <File Id="seafile_ext.dll" Name="seafile_ext.dll" Source="custom\seafile_ext.dll" />
+            <File Id="seafile_ext64.dll" Name="seafile_ext64.dll" Source="custom\seafile_ext64.dll" />
           </Component>
         </Directory>
       </Directory>
 
       <Directory Id='ProgramFilesFolder' Name='PFiles'>
         <Directory Id='INSTALLDIR' Name='!(loc.AppName)'>
-          <Component Id="comp_manual" KeyPath="yes" Guid="$(var.GuidOfManualComponent)">
-            <File Id="manual.txt" Name="!(loc.UserManualName)" Source="!(loc.UserManualSource)" />
-          </Component>
-
           <Directory Id='bin_Dir' Name='bin'>
             <Component Id='comp_custom' Guid="$(var.GuidOfCustomComponent)">
               <RegistryKey Root="HKCU" Key="Software\[Manufacturer]\[ProductName]" Action="createAndRemoveOnUninstall">
@@ -63,6 +104,7 @@
           </Directory>
         </Directory>
       </Directory>
+
     </Directory>
 
     <Property Id="SEAFILE_AUTO_START">1</Property>
@@ -109,14 +151,19 @@
 
     <CustomAction Id="RemoveSeafileUserData" FileKey="seafileapplet.exe" ExeCommand="--remove-user-data"
                   Execute="immediate" Impersonate="yes" Return="ignore" />
+    <CustomAction Id="StopSeafile" FileKey="seafileapplet.exe" ExeCommand="--stop"
+                  Execute="immediate" Impersonate="yes" Return="ignore" />
 
     <InstallExecuteSequence>
-      <!-- Move away seafile shell extension so we don't need to kill explorer during uninstall. -->
+      <!-- Move away seafile shell extension so we don't need to kill explorer during upgrade or uninstall. -->
       <Custom Action="MoveExtDll" Before="InstallValidate">
-        Installed AND (NOT VersionNT64)
+        ((REMOVE="ALL") OR UPGRADINGPRODUCTCODE OR WIX_UPGRADE_DETECTED) AND (NOT VersionNT64)
       </Custom>
       <Custom Action="MoveExtDll64" Before="InstallValidate">
-        Installed AND VersionNT64
+        ((REMOVE="ALL") OR UPGRADINGPRODUCTCODE OR WIX_UPGRADE_DETECTED) AND VersionNT64
+      </Custom>
+      <Custom Action="StopSeafile" Before="InstallValidate">
+        UPGRADINGPRODUCTCODE OR WIX_UPGRADE_DETECTED
       </Custom>
 
       <!-- Remove User data, as well as seafile QSettings in registry -->
@@ -132,7 +179,7 @@
       <UIRef Id='WixUI_ErrorProgressText' />
       <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication">
         <!-- Launch Seafile after setup. -->
-        NOT Installed
+        (NOT Installed) AND  (NOT SUPPRESS_LAUNCH_SEAFILE_AFTER_INSTALL_FINISH)
       </Publish>
     </UI>
 
@@ -143,13 +190,12 @@
       <ComponentRef Id='Seafile_StartMenuShortCut' />
       <ComponentRef Id="SeafileAutoStart" />
       <ComponentRef Id='comp_custom' />
-      <ComponentRef Id='comp_manual' />
       <!-- defined in fragment.wxs -->
       <ComponentGroupRef Id='group_bin' />
       <!-- defined in shell.wxs -->
       <ComponentRef Id='comp_shell' />
       <ComponentRef Id='comp_shell64' />
-      <ComponentRef Id='seafile_shell_ext' />
+      <ComponentRef Id='seafile_ext' />
     </Feature>
 
     <Property Id="CHECKBOX_DEL_SEAFILE_DATA" Secure="yes" />

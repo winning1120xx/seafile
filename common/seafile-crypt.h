@@ -1,19 +1,7 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 
-/*
-  Description:
-  
-  The function pair "seafile_encrypt/seafile_decrypt" are used to
-  encrypt/decrypt data in the seafile system, using AES 128 bit ecb
-  algorithm provided by openssl.
-*/  
-
 #ifndef _SEAFILE_CRYPT_H
 #define _SEAFILE_CRYPT_H
-
-#include <openssl/aes.h>
-#include <openssl/evp.h>
-
 
 /* Block size, in bytes. For AES it can only be 16 bytes. */
 #define BLK_SIZE 16
@@ -54,33 +42,46 @@ seafile_crypt_new (int version, unsigned char *key, unsigned char *iv);
 
 int
 seafile_derive_key (const char *data_in, int in_len, int version,
+                    const char *repo_salt,
                     unsigned char *key, unsigned char *iv);
+
+/* @salt must be an char array of size 65 bytes. */
+int
+seafile_generate_repo_salt (char *repo_salt);
 
 /*
  * Generate the real key used to encrypt data.
  * The key 32 bytes long and encrpted with @passwd.
  */
-void
-seafile_generate_random_key (const char *passwd, char *random_key);
+int
+seafile_generate_random_key (const char *passwd,
+                             int version,
+                             const char *repo_salt,
+                             char *random_key);
 
 void
 seafile_generate_magic (int version, const char *repo_id,
-                        const char *passwd, char *magic);
+                        const char *repo_salt,
+                        const char *passwd,
+                        char *magic);
 
 int
 seafile_verify_repo_passwd (const char *repo_id,
                             const char *passwd,
                             const char *magic,
-                            int version);
+                            int version,
+                            const char *repo_salt);
 
 int
 seafile_decrypt_repo_enc_key (int enc_version,
-                               const char *passwd, const char *random_key,
-                               unsigned char *key_out, unsigned char *iv_out);
+                              const char *passwd, const char *random_key,
+                              const char *repo_salt,
+                              unsigned char *key_out, unsigned char *iv_out);
 
 int
 seafile_update_random_key (const char *old_passwd, const char *old_random_key,
-                           const char *new_passwd, char *new_random_key);
+                           const char *new_passwd, char *new_random_key,
+                           int enc_version, const char *repo_salt);
 
 int
 seafile_encrypt (char **data_out,
@@ -96,11 +97,5 @@ seafile_decrypt (char **data_out,
                  const char *data_in,
                  const int in_len,
                  SeafileCrypt *crypt);
-
-int
-seafile_decrypt_init (EVP_CIPHER_CTX *ctx,
-                      int version,
-                      const unsigned char *key,
-                      const unsigned char *iv);
 
 #endif  /* _SEAFILE_CRYPT_H */

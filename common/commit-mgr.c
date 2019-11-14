@@ -5,7 +5,6 @@
 #include "log.h"
 
 #include <jansson.h>
-#include <openssl/sha.h>
 
 #include "utils.h"
 #include "db.h"
@@ -13,7 +12,6 @@
 
 #include "seafile-session.h"
 #include "commit-mgr.h"
-#include "seaf-utils.h"
 
 #define MAX_TIME_SKEW 259200    /* 3 days */
 
@@ -40,23 +38,25 @@ commit_from_json_object (const char *id, json_t *object);
 
 static void compute_commit_id (SeafCommit* commit)
 {
-    SHA_CTX ctx;
+    GChecksum *ctx = g_checksum_new(G_CHECKSUM_SHA1);
     uint8_t sha1[20];    
     gint64 ctime_n;
 
-    SHA1_Init (&ctx);
-    SHA1_Update (&ctx, commit->root_id, 41);
-    SHA1_Update (&ctx, commit->creator_id, 41);
+    g_checksum_update (ctx, (guchar *)commit->root_id, 41);
+    g_checksum_update (ctx, (guchar *)commit->creator_id, 41);
     if (commit->creator_name)
-        SHA1_Update (&ctx, commit->creator_name, strlen(commit->creator_name)+1);
-    SHA1_Update (&ctx, commit->desc, strlen(commit->desc)+1);
+        g_checksum_update (ctx, (guchar *)commit->creator_name, strlen(commit->creator_name)+1);
+    g_checksum_update (ctx, (guchar *)commit->desc, strlen(commit->desc)+1);
 
     /* convert to network byte order */
     ctime_n = hton64 (commit->ctime);
-    SHA1_Update (&ctx, &ctime_n, sizeof(ctime_n));
-    SHA1_Final (sha1, &ctx);
+    g_checksum_update (ctx, (guchar *)&ctime_n, sizeof(ctime_n));
+
+    gsize len = 20;
+    g_checksum_get_digest (ctx, sha1, &len);
     
     rawdata_to_hex (sha1, commit->commit_id, 20);
+    g_checksum_free (ctx);
 }
 
 SeafCommit*
@@ -140,10 +140,7 @@ seaf_commit_from_data (const char *id, char *data, gsize len)
 
         object = json_loadb (data, len, 0, &jerror);
         if (!object) {
-            if (jerror.text)
-                seaf_warning ("Failed to load commit json: %s.\n", jerror.text);
-            else
-                seaf_warning ("Failed to load commit json.\n");
+            seaf_warning ("Failed to load commit json: %s.\n", jerror.text);
             return NULL;
         }
     }
@@ -635,8 +632,10 @@ commit_to_json_object (SeafCommit *commit)
         json_object_set_int_member (object, "enc_version", commit->enc_version);
         if (commit->enc_version >= 1)
             json_object_set_string_member (object, "magic", commit->magic);
-        if (commit->enc_version == 2)
+        if (commit->enc_version >= 2)
             json_object_set_string_member (object, "key", commit->random_key);
+        if (commit->enc_version >= 3)
+            json_object_set_string_member (object, "salt", commit->salt);
     }
     if (commit->no_local_history)
         json_object_set_int_member (object, "no_local_history", 1);
@@ -672,6 +671,7 @@ commit_from_json_object (const char *commit_id, json_t *object)
     int enc_version = 0;
     const char *magic = NULL;
     const char *random_key = NULL;
+    const char *salt = NULL;
     int no_local_history = 0;
     int version = 0;
     int conflict = 0, new_merge = 0;
@@ -708,8 +708,10 @@ commit_from_json_object (const char *commit_id, json_t *object)
         magic = json_object_get_string_member (object, "magic");
     }
 
-    if (enc_version == 2)
+    if (enc_version >= 2)
         random_key = json_object_get_string_member (object, "key");
+    if (enc_version >= 3)
+        salt = json_object_get_string_member (object, "salt");
 
     if (json_object_has_member (object, "no_local_history"))
         no_local_history = json_object_get_int_member (object, "no_local_history");
@@ -747,6 +749,14 @@ commit_from_json_object (const char *commit_id, json_t *object)
         if (!random_key || strlen(random_key) != 96)
             return NULL;
         break;
+    case 3:
+        if (!magic || strlen(magic) != 64)
+            return NULL;
+        if (!random_key || strlen(random_key) != 96)
+            return NULL;
+        if (!salt || strlen(salt) != 64)
+            return NULL;
+        break;
     default:
         seaf_warning ("Unknown encryption version %d.\n", enc_version);
         return NULL;
@@ -775,8 +785,10 @@ commit_from_json_object (const char *commit_id, json_t *object)
         commit->enc_version = enc_version;
         if (enc_version >= 1)
             commit->magic = g_strdup(magic);
-        if (enc_version == 2)
+        if (enc_version >= 2)
             commit->random_key = g_strdup (random_key);
+        if (enc_version >= 3)
+            commit->salt = g_strdup(salt);
     }
     if (no_local_history)
         commit->no_local_history = TRUE;
@@ -820,10 +832,7 @@ load_commit (SeafCommitManager *mgr,
 
         object = json_loadb (data, len, 0, &jerror);
         if (!object) {
-            if (jerror.text)
-                seaf_warning ("Failed to load commit json object: %s.\n", jerror.text);
-            else
-                seaf_warning ("Failed to load commit json object.\n");
+            seaf_warning ("Failed to load commit json object: %s.\n", jerror.text);
             goto out;
         }
     }

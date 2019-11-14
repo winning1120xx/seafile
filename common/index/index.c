@@ -22,7 +22,6 @@
 
 #include <glib.h>
 #include <glib/gstdio.h>
-#include <openssl/sha.h>
 
 #ifdef WIN32
 
@@ -75,8 +74,9 @@ static void replace_index_entry(struct index_state *istate, int nr, struct cache
 
 static int verify_hdr(struct cache_header *hdr, unsigned long size)
 {
-    SHA_CTX c;
+    GChecksum *c;
     unsigned char sha1[20];
+    gsize len = 20;
 
     if (hdr->hdr_signature != htonl(CACHE_SIGNATURE)) {
         g_critical("bad signature\n");
@@ -87,28 +87,15 @@ static int verify_hdr(struct cache_header *hdr, unsigned long size)
         g_critical("bad index version\n");
         return -1;
     }
-    SHA1_Init(&c);
-    SHA1_Update(&c, hdr, size - 20);
-    SHA1_Final(sha1, &c);
+    c = g_checksum_new (G_CHECKSUM_SHA1);
+    g_checksum_update(c, (unsigned char *)hdr, size - 20);
+    g_checksum_get_digest (c, sha1, &len);
+    g_checksum_free (c);
     if (hashcmp(sha1, (unsigned char *)hdr + size - 20)) {
         g_critical("bad index file sha1 signature\n");
         return -1;
     }
     return 0;
-}
-
-static inline size_t estimate_cache_size(size_t ondisk_size, unsigned int entries)
-{
-    long per_entry;
-
-    per_entry = sizeof(struct cache_entry) - sizeof(struct ondisk_cache_entry);
-
-    /*
-     * Alignment can cause differences. This should be "alignof", but
-     * since that's a gcc'ism, just use the size of a pointer.
-     */
-    per_entry += sizeof(void *);
-    return ondisk_size + entries*per_entry;
 }
 
 static int convert_from_disk(struct ondisk_cache_entry *ondisk, struct cache_entry **ce)
@@ -476,21 +463,6 @@ void mark_all_ce_unused(struct index_state *index)
         index->cache[i]->ce_flags &= ~(CE_UNPACKED | CE_ADDED | CE_NEW_SKIP_WORKTREE);
 }
 
-
-static int is_empty_blob_sha1(const unsigned char *sha1)
-{
-    /* static const unsigned char empty_blob_sha1[20] = { */
-    /*     0xe6,0x9d,0xe2,0x9b,0xb2,0xd1,0xd6,0x43,0x4b,0x8b, */
-    /*     0x29,0xae,0x77,0x5a,0xd8,0xc2,0xe4,0x8c,0x53,0x91 */
-    /* }; */
-
-    static const unsigned char empty_blob_sha1[20] = {
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-    };
-    return !hashcmp(sha1, empty_blob_sha1);
-}
-
 static int ce_match_stat_basic(struct cache_entry *ce, SeafStat *st)
 {
     unsigned int changed = 0;
@@ -524,7 +496,7 @@ static int ce_match_stat_basic(struct cache_entry *ce, SeafStat *st)
         seaf_warning("internal error: ce_mode is %o\n", ce->ce_mode);
         return -1;
     }
-    if (ce->ce_mtime.sec != st->st_mtime)
+    if (!is_eml_file (ce->name) && ce->ce_mtime.sec != st->st_mtime)
         changed |= MTIME_CHANGED;
     /* if (ce->ce_ctime.sec != st->st_ctime) */
     /*     changed |= CTIME_CHANGED; */
@@ -1736,12 +1708,14 @@ static int type_from_string(const char *str)
 static void hash_sha1_file(const void *buf, unsigned long len,
                            const char *type, unsigned char *sha1)
 {
-    SHA_CTX c;
+    GChecksum *c;
+    gsize cs_len = 20;
 
     /* Sha1.. */
-    SHA1_Init(&c);
-    SHA1_Update(&c, buf, len);
-    SHA1_Final(sha1, &c);
+    c = g_checksum_new (G_CHECKSUM_SHA1);
+    g_checksum_update(c, buf, len);
+    g_checksum_get_digest (c, sha1, &cs_len);
+    g_checksum_free (c);
 }
 
 static int index_mem(unsigned char *sha1, void *buf, uint64_t size,
@@ -1825,7 +1799,7 @@ static unsigned long write_buffer_len;
 #define WRITE_BUFFER_SIZE 8192
 
 typedef struct {
-    SHA_CTX context;
+    GChecksum *context;
     unsigned char write_buffer[WRITE_BUFFER_SIZE];
     unsigned long write_buffer_len;
 } WriteIndexInfo;
@@ -1834,7 +1808,7 @@ static int ce_write_flush(WriteIndexInfo *info, int fd)
 {
     unsigned int buffered = info->write_buffer_len;
     if (buffered) {
-        SHA1_Update(&info->context, info->write_buffer, buffered);
+        g_checksum_update(info->context, info->write_buffer, buffered);
         if (writen(fd, info->write_buffer, buffered) != buffered)
             return -1;
         info->write_buffer_len = 0;
@@ -1876,10 +1850,11 @@ static int write_index_ext_header(WriteIndexInfo *info, int fd,
 static int ce_flush(WriteIndexInfo *info, int fd)
 {
     unsigned int left = info->write_buffer_len;
+    gsize len = 20;
 
     if (left) {
         info->write_buffer_len = 0;
-        SHA1_Update(&info->context, info->write_buffer, left);
+        g_checksum_update(info->context, info->write_buffer, left);
     }
 
     /* Flush first if not enough space for SHA1 signature */
@@ -1890,7 +1865,7 @@ static int ce_flush(WriteIndexInfo *info, int fd)
     }
 
     /* Append the SHA1 signature at the end */
-    SHA1_Final(info->write_buffer + left, &info->context);
+    g_checksum_get_digest (info->context, info->write_buffer + left, &len);
     left += 20;
     return (writen(fd, info->write_buffer, left) != left) ? -1 : 0;
 }
@@ -1944,38 +1919,6 @@ static void ce_smudge_racily_clean_entry(struct cache_entry *ce)
     ce->ce_size = 0;
 }
 #endif
-
-static int ce_write_entry(WriteIndexInfo *info, int fd, struct cache_entry *ce)
-{
-    int size = ondisk_ce_size(ce);
-    struct ondisk_cache_entry *ondisk = calloc(1, size);
-    char *name;
-    int result;
-
-    ondisk->ctime.sec = htonl((unsigned int)ce->ce_ctime.sec);
-    ondisk->mtime.sec = htonl((unsigned int)ce->ce_mtime.sec);
-    ondisk->dev  = htonl(ce->ce_dev);
-    ondisk->ino  = htonl(ce->ce_ino);
-    ondisk->mode = htonl(ce->ce_mode);
-    ondisk->uid  = htonl(ce->ce_uid);
-    ondisk->gid  = htonl(ce->ce_gid);
-    ondisk->size = hton64(ce->ce_size);
-    hashcpy(ondisk->sha1, ce->sha1);
-    ondisk->flags = htons(ce->ce_flags);
-    /* if (ce->ce_flags & CE_EXTENDED) { */
-    /*     struct ondisk_cache_entry_extended *ondisk2; */
-    /*     ondisk2 = (struct ondisk_cache_entry_extended *)ondisk; */
-    /*     ondisk2->flags2 = htons((ce->ce_flags & CE_EXTENDED_FLAGS) >> 16); */
-    /*     name = ondisk2->name; */
-    /* } */
-    /* else */
-    name = ondisk->name;
-    memcpy(name, ce->name, ce_namelen(ce));
-
-    result = ce_write(info, fd, ondisk, size);
-    free(ondisk);
-    return result;
-}
 
 static int ce_write_entry2(WriteIndexInfo *info, int fd, struct cache_entry *ce)
 {
@@ -2031,6 +1974,7 @@ int write_index(struct index_state *istate, int newfd)
     struct cache_entry **cache = istate->cache;
     int entries = istate->cache_nr;
     SeafStat st;
+    int ret = 0;
 
     memset (&info, 0, sizeof(info));
 
@@ -2051,9 +1995,11 @@ int write_index(struct index_state *istate, int newfd)
     hdr.hdr_version = htonl(4);
     hdr.hdr_entries = htonl(entries - removed);
 
-    SHA1_Init(&info.context);
-    if (ce_write(&info, newfd, &hdr, sizeof(hdr)) < 0)
-        return -1;
+    info.context = g_checksum_new (G_CHECKSUM_SHA1);
+    if (ce_write(&info, newfd, &hdr, sizeof(hdr)) < 0) {
+        ret = -1;
+        goto out;
+    }
 
     for (i = 0; i < entries; i++) {
         struct cache_entry *ce = cache[i];
@@ -2061,8 +2007,10 @@ int write_index(struct index_state *istate, int newfd)
             continue;
         /* if (!ce_uptodate(ce) && is_racy_timestamp(istate, ce)) */
         /*     ce_smudge_racily_clean_entry(ce); */
-        if (ce_write_entry2(&info, newfd, ce) < 0)
-            return -1;
+        if (ce_write_entry2(&info, newfd, ce) < 0) {
+            ret = -1;
+            goto out;
+        }
     }
 
     /* Write extension data here */
@@ -2072,21 +2020,30 @@ int write_index(struct index_state *istate, int newfd)
 
         if (modifiers_to_string (buf, istate) < 0) {
             g_string_free (buf, TRUE);
-            return -1;
+            ret = -1;
+            goto out;
         }
 
         err = write_index_ext_header(&info, newfd, CACHE_EXT_MODIFIER, buf->len) < 0
             || ce_write(&info, newfd, buf->str, buf->len) < 0;
         g_string_free (buf, TRUE);
-        if (err)
-            return -1;
+        if (err) {
+            ret = -1;
+            goto out;
+        }
     }
 
-    if (ce_flush(&info, newfd) || seaf_fstat(newfd, &st))
-        return -1;
+    if (ce_flush(&info, newfd) || seaf_fstat(newfd, &st)) {
+        ret = -1;
+        goto out;
+    }
+
     istate->timestamp.sec = (unsigned int)st.st_mtime;
     istate->timestamp.nsec = 0;
-    return 0;
+
+out:
+    g_checksum_free (info.context);
+    return ret;
 }
 
 int discard_index(struct index_state *istate)
